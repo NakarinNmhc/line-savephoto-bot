@@ -7,6 +7,10 @@ const path = require("path");
 
 const app = express();
 
+// Health check สำหรับ Render
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/webhook", (req, res) => res.status(200).send("OK"));
+
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -28,9 +32,7 @@ if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true
 // =====================
 // Helpers
 // =====================
-function pad(n) {
-  return String(n).padStart(2, "0");
-}
+const pad = (n) => String(n).padStart(2, "0");
 
 function makeFileName(messageId) {
   const d = new Date();
@@ -62,8 +64,8 @@ function saveStreamToFile(stream, filePath) {
 // =====================
 // Cache: group/room name
 // =====================
-const nameCache = new Map(); // key -> { name, ts }
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ชม.
+const nameCache = new Map();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 async function getGroupOrRoomName(source) {
   if (!source?.type) return null;
@@ -114,16 +116,22 @@ async function getSourceFolder(event) {
 }
 
 // =====================
-// Health check
+// “เงียบในกลุ่ม” switch
 // =====================
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/webhook", (req, res) => res.status(200).send("OK"));
+function isGroupOrRoom(event) {
+  const t = event?.source?.type;
+  return t === "group" || t === "room";
+}
+
+function isPrivateChat(event) {
+  return event?.source?.type === "user";
+}
 
 // =====================
 // Webhook
 // =====================
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  // ตอบ 200 ให้เร็ว กัน LINE timeout
+  // ตอบ 200 เร็ว ๆ กัน timeout
   res.sendStatus(200);
 
   const events = req.body?.events || [];
@@ -131,48 +139,63 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   for (const event of events) {
     try {
-      // ✅ ทักทายเฉพาะตอน add friend / join group (ถ้าอยากปิดอันนี้ด้วย บอกได้)
-      if (event.type === "join" || event.type === "follow") {
-        if (event.replyToken) {
+      // =========================
+      // 1) ถ้าเป็นกลุ่ม/ห้อง → เงียบทั้งหมด (ไม่ตอบ)
+      // =========================
+      const silent = isGroupOrRoom(event);
+
+      // =========================
+      // 2) ทักทาย (เฉพาะแชทส่วนตัว)
+      // =========================
+      if (!silent && (event.type === "follow" || event.type === "join")) {
+        // join ในกลุ่มจะ silent แล้วไม่เข้ามาถึงตรงนี้
+        await client.replyMessage(event.replyToken, [
+          { type: "text", text: "สวัสดีครับ 🙂 ส่งรูปมาได้เลย ผมจะบันทึกให้ครับ" },
+        ]);
+        continue;
+      }
+
+      // =========================
+      // 3) ข้อความ (เฉพาะแชทส่วนตัว)
+      // =========================
+      if (!silent && event.type === "message" && event.message?.type === "text") {
+        await client.replyMessage(event.replyToken, [
+          { type: "text", text: "รับทราบครับ ✅ ส่งรูปมาได้เลย" },
+        ]);
+        continue;
+      }
+
+      // =========================
+      // 4) รับรูป (บันทึกทุกที่ แต่ “ตอบกลับ” เฉพาะแชทส่วนตัว)
+      // =========================
+      if (event.type === "message" && event.message?.type === "image") {
+        const messageId = event.message.id;
+        const folderName = await getSourceFolder(event);
+
+        const targetDir = path.join(baseImagesDir, folderName);
+        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+
+        const fileName = makeFileName(messageId);
+        const filePath = path.join(targetDir, fileName);
+
+        console.log("📷 Image received:", messageId, "->", folderName);
+
+        const stream = await client.getMessageContent(messageId);
+        await saveStreamToFile(stream, filePath);
+
+        console.log("✅ Image saved:", filePath);
+
+        // ตอบกลับเฉพาะแชทส่วนตัวเท่านั้น
+        if (isPrivateChat(event) && event.replyToken) {
           await client.replyMessage(event.replyToken, [
-            { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว ส่งรูปมาได้เลย" },
+            { type: "text", text: `✅ บันทึกรูปเรียบร้อย\nไฟล์: ${fileName}` },
           ]);
         }
-        console.log("✅ Replied welcome for:", event.type, event.source);
+
         continue;
       }
 
-      // ❌ ตัดการตอบข้อความ text อัตโนมัติออก (ตามที่ขอ)
-      if (event.type === "message" && event.message?.type === "text") {
-        // ไม่ตอบอะไร
-        continue;
-      }
-
-      // ✅ รับรูป + บันทึก + ตอบกลับ “หลังบันทึกเสร็จ” (ตอบครั้งเดียว)
-     // 3) รับรูป
-if (event.type === "message" && event.message?.type === "image") {
-  const messageId = event.message.id;
-  const folderName = await getSourceFolder(event);
-
-  const targetDir = path.join(baseImagesDir, folderName);
-  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-
-  const fileName = makeFileName(messageId);
-  const filePath = path.join(targetDir, fileName);
-
-  console.log("📷 Image received:", messageId, "->", folderName);
-
-  const stream = await client.getMessageContent(messageId);
-  await saveStreamToFile(stream, filePath);
-
-  console.log("✅ Image saved:", filePath);
-
-  // ❌ ลบ/ไม่ต้องมี replyMessage / pushMessage ใดๆ
-  continue;
-}
-
-
-      // event อื่น ๆ ไม่ตอบ
+      // event อื่น ๆ: ไม่ทำอะไร
     } catch (err) {
       console.error("❌ Error:", err);
       console.error("LINE API error body:", err?.originalError?.response?.data);
