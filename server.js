@@ -148,13 +148,13 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
 
       // 2) ข้อความเทส
-      if (event.type === "message" && event.message?.type === "text") {
+      /*if (event.type === "message" && event.message?.type === "text") {
         await client.replyMessage(event.replyToken, [
           { type: "text", text: "✅ เห็นข้อความแล้วครับ ส่งรูปมาได้เลย" },
         ]);
         continue;
       }
-
+*/
       // 3) รับรูป
       if (event.type === "message" && event.message?.type === "image") {
         const messageId = event.message.id;
@@ -167,14 +167,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         const filePath = path.join(targetDir, fileName);
 
         console.log("📷 Image received:", messageId, "->", folderName);
-
+/*
         // reply ทันที (กัน replyToken หมดอายุ) — ใช้ได้ครั้งเดียว
         if (event.replyToken) {
           await client.replyMessage(event.replyToken, [
             { type: "text", text: "📥 รับรูปแล้วครับ กำลังบันทึก..." },
           ]);
         }
-
+*/
         // โหลดรูปจาก LINE และบันทึกไฟล์
         const stream = await client.getMessageContent(messageId);
         await saveStreamToFile(stream, filePath);
