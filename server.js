@@ -1,5 +1,7 @@
 //te2Vfvwg4Qe7IbDYgQRPZrn9k5rCTVRP7EaEPgudeGVAVsJwwJquX5mh6+dZMGc4nCftCN7RVbBW9OmH++bZQ4Lye7nldVedlmja3O58c4suHUP/aDnswixvrgbGqZyeHH6+MLPLM0OCjKyOWV35kAdB04t89/1O/w1cDnyilFU=
 //f82f6612b4ca51cee0cefafdd641f225
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/webhook", (req, res) => res.status(200).send("OK"));
 
 require("dotenv").config();
 
