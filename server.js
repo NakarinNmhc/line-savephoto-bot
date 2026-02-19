@@ -7,10 +7,6 @@ const path = require("path");
 
 const app = express();
 
-// Health check สำหรับ Render
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/webhook", (req, res) => res.status(200).send("OK"));
-
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -23,6 +19,10 @@ if (!config.channelAccessToken || !config.channelSecret) {
 
 const client = new line.Client(config);
 
+// Health check (Render/Browser)
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/webhook", (req, res) => res.status(200).send("OK")); // กัน verify แบบ GET บางที่
+
 // =====================
 // Storage base folder
 // =====================
@@ -32,7 +32,9 @@ if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true
 // =====================
 // Helpers
 // =====================
-const pad = (n) => String(n).padStart(2, "0");
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
 
 function makeFileName(messageId) {
   const d = new Date();
@@ -64,8 +66,8 @@ function saveStreamToFile(stream, filePath) {
 // =====================
 // Cache: group/room name
 // =====================
-const nameCache = new Map();
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const nameCache = new Map(); // key -> { name, ts }
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ชั่วโมง
 
 async function getGroupOrRoomName(source) {
   if (!source?.type) return null;
@@ -98,6 +100,7 @@ async function getGroupOrRoomName(source) {
 async function getSourceFolder(event) {
   const src = event.source || {};
 
+  // แชทส่วนตัว
   if (src.type === "user") return "private";
 
   const name = await getGroupOrRoomName(src);
@@ -113,14 +116,6 @@ async function getSourceFolder(event) {
   }
 
   return "unknown";
-}
-
-// =====================
-// “เงียบในกลุ่ม” switch
-// =====================
-function isGroupOrRoom(event) {
-  const t = event?.source?.type;
-  return t === "group" || t === "room";
 }
 
 function isPrivateChat(event) {
@@ -139,35 +134,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   for (const event of events) {
     try {
-      // =========================
-      // 1) ถ้าเป็นกลุ่ม/ห้อง → เงียบทั้งหมด (ไม่ตอบ)
-      // =========================
-      const silent = isGroupOrRoom(event);
+      // 0) ไม่ส่งข้อความในกลุ่ม/รูม (กันวุ่นวาย)
+      //    แต่ในแชทส่วนตัว เราจะตอบเฉพาะตอนบันทึกเสร็จ
+      const privateChat = isPrivateChat(event);
 
-      // =========================
-      // 2) ทักทาย (เฉพาะแชทส่วนตัว)
-      // =========================
-      if (!silent && (event.type === "follow" || event.type === "join")) {
-        // join ในกลุ่มจะ silent แล้วไม่เข้ามาถึงตรงนี้
-        await client.replyMessage(event.replyToken, [
-          { type: "text", text: "สวัสดีครับ 🙂 ส่งรูปมาได้เลย ผมจะบันทึกให้ครับ" },
-        ]);
-        continue;
-      }
-
-      // =========================
-      // 3) ข้อความ (เฉพาะแชทส่วนตัว)
-      // =========================
-      if (!silent && event.type === "message" && event.message?.type === "text") {
-        await client.replyMessage(event.replyToken, [
-          { type: "text", text: "รับทราบครับ ✅ ส่งรูปมาได้เลย" },
-        ]);
-        continue;
-      }
-
-      // =========================
-      // 4) รับรูป (บันทึกทุกที่ แต่ “ตอบกลับ” เฉพาะแชทส่วนตัว)
-      // =========================
+      // 1) รับรูปเท่านั้น (ไม่ตอบข้อความ text, ไม่ทัก join/follow)
       if (event.type === "message" && event.message?.type === "image") {
         const messageId = event.message.id;
         const folderName = await getSourceFolder(event);
@@ -185,8 +156,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
         console.log("✅ Image saved:", filePath);
 
-        // ตอบกลับเฉพาะแชทส่วนตัวเท่านั้น
-        if (isPrivateChat(event) && event.replyToken) {
+        // ✅ ตอบกลับเฉพาะแชทส่วนตัวเท่านั้น (ไม่ส่งอะไรในกลุ่ม)
+        if (privateChat && event.replyToken) {
           await client.replyMessage(event.replyToken, [
             { type: "text", text: `✅ บันทึกรูปเรียบร้อย\nไฟล์: ${fileName}` },
           ]);
@@ -195,7 +166,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // event อื่น ๆ: ไม่ทำอะไร
+      // event อื่น ๆ ไม่ต้องทำอะไร (เงียบ)
     } catch (err) {
       console.error("❌ Error:", err);
       console.error("LINE API error body:", err?.originalError?.response?.data);
