@@ -1,10 +1,6 @@
-/**
- * SavePhotoBot - production-ready for Render
- * - Silent in group/room (never reply to group/room)
- * - Save images to /images/<source-folder>
- * - Notify ADMIN_USER_ID via DM whenever image is sent in group/room
- * - Optional: static route to view images with IMAGE_VIEW_TOKEN
- */
+
+//te2Vfvwg4Qe7IbDYgQRPZrn9k5rCTVRP7EaEPgudeGVAVsJwwJquX5mh6+dZMGc4nCftCN7RVbBW9OmH++bZQ4Lye7nldVedlmja3O58c4suHUP/aDnswixvrgbGqZyeHH6+MLPLM0OCjKyOWV35kAdB04t89/1O/w1cDnyilFU=
+//f82f6612b4ca51cee0cefafdd641f225
 
 require("dotenv").config();
 
@@ -15,63 +11,46 @@ const path = require("path");
 
 const app = express();
 
-/* -------------------- Health check -------------------- */
 app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.status(200).send("OK"));
+app.get("/webhook", (req, res) => res.status(200).send("OK"));
 
-/* -------------------- ENV -------------------- */
-const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 
-// Optional: protect image viewing route
-const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
-
-/* -------------------- Validate ENV -------------------- */
-if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  console.error("❌ Missing LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
-  process.exit(1);
-}
-if (!ADMIN_USER_ID) {
-  console.error("❌ Missing ADMIN_USER_ID (must be set in Render > Environment)");
-  process.exit(1);
-}
-
-/* -------------------- LINE client -------------------- */
 const config = {
-  channelAccessToken: LINE_ACCESS_TOKEN,
-  channelSecret: LINE_CHANNEL_SECRET,
+  channelAccessToken: process.env.LINE_ACCESS_TOKEN,
+  channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
+
+if (!config.channelAccessToken || !config.channelSecret) {
+  console.error("❌ Missing env: LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
+  process.exit(1);
+}
+
 const client = new line.Client(config);
 
-/* -------------------- Storage -------------------- */
+// =====================
+// Storage base folder
+// =====================
 const baseImagesDir = path.join(__dirname, "images");
 if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true });
 
-/* -------------------- Static route (Express 5 safe) -------------------- */
-// IMPORTANT: Do NOT use "/images/*" (it can crash with path-to-regexp)
-// Use RegExp route instead.
-app.get(/^\/images\/.*/, (req, res, next) => {
-  // If token not set => open (dev mode)
-  if (!IMAGE_VIEW_TOKEN) return next();
-  if (req.query.token !== IMAGE_VIEW_TOKEN) return res.sendStatus(403);
-  return next();
-});
-app.use("/images", express.static(baseImagesDir));
-
-/* -------------------- Helpers -------------------- */
+// =====================
+// Helpers
+// =====================
 function pad(n) {
   return String(n).padStart(2, "0");
 }
 
-function makeFileName(messageId, ext = "jpg") {
+function makeFileName(messageId) {
   const d = new Date();
-  // requirement: date + messageId
-  // (add time is optional; we keep it clean: YYYY-MM-DD_messageId.ext)
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${messageId}.${ext}`;
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}` +
+    `_${messageId}.jpg`
+  );
 }
 
 function sanitizeFolderName(name) {
+  // กันอักขระต้องห้ามใน Windows + ย่อความยาว
   return String(name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
     .replace(/\s+/g, " ")
@@ -89,159 +68,144 @@ function saveStreamToFile(stream, filePath) {
   });
 }
 
-function buildPublicBaseUrl(req) {
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  return `${proto}://${host}`;
-}
+// =====================
+// Cache: group/room name
+// =====================
+const nameCache = new Map(); // key -> { name, ts }
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ชั่วโมง
 
-function sourceLabel(event) {
-  const s = event.source || {};
-  if (s.type === "group") return `GROUP (${(s.groupId || "").slice(-6)})`;
-  if (s.type === "room") return `ROOM (${(s.roomId || "").slice(-6)})`;
-  if (s.type === "user") return `PRIVATE (${(s.userId || "").slice(-6)})`;
-  return "UNKNOWN";
-}
+async function getGroupOrRoomName(source) {
+  if (!source?.type) return null;
 
-/* -------------------- Cache group name (optional) -------------------- */
-const nameCache = new Map(); // groupId -> {name, ts}
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  // GROUP
+  if (source.type === "group" && source.groupId) {
+    const key = `group:${source.groupId}`;
+    const cached = nameCache.get(key);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
 
-async function getGroupName(groupId) {
-  const cached = nameCache.get(groupId);
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
+    const summary = await client.getGroupSummary(source.groupId); // { groupId, groupName, pictureUrl }
+    const name = sanitizeFolderName(summary.groupName || "UnknownGroup");
+    nameCache.set(key, { name, ts: Date.now() });
+    return name;
+  }
 
-  const summary = await client.getGroupSummary(groupId);
-  const name = sanitizeFolderName(summary.groupName || "UnknownGroup");
-  nameCache.set(groupId, { name, ts: Date.now() });
-  return name;
+  // ROOM
+  if (source.type === "room" && source.roomId) {
+    const key = `room:${source.roomId}`;
+    const cached = nameCache.get(key);
+    if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
+
+    const summary = await client.getRoomSummary(source.roomId); // { roomId, roomName, pictureUrl }
+    const name = sanitizeFolderName(summary.roomName || "UnknownRoom");
+    nameCache.set(key, { name, ts: Date.now() });
+    return name;
+  }
+
+  return null;
 }
 
 async function getSourceFolder(event) {
-  const s = event.source || {};
+  const src = event.source || {};
 
-  if (s.type === "user") return "private";
+  if (src.type === "user") return "private";
 
-  if (s.type === "group" && s.groupId) {
-    const tail = s.groupId.slice(-6);
-    try {
-      const name = await getGroupName(s.groupId);
-      return `group_${name}_${tail}`;
-    } catch (_) {
-      return `group_${tail}`;
-    }
+  const name = await getGroupOrRoomName(src);
+
+  if (src.type === "group" && src.groupId) {
+    const tail = src.groupId.slice(-6);
+    return name ? `group_${name}_${tail}` : `group_${src.groupId}`;
   }
 
-  if (s.type === "room" && s.roomId) {
-    // LINE API ไม่มี getRoomSummary => ใช้ roomId แทน
-    const tail = s.roomId.slice(-6);
-    return `room_${tail}`;
+  if (src.type === "room" && src.roomId) {
+    const tail = src.roomId.slice(-6);
+    return name ? `room_${name}_${tail}` : `room_${src.roomId}`;
   }
 
   return "unknown";
 }
 
-/* -------------------- Dedupe (webhook retry) -------------------- */
-const seenMessageIds = new Set();
-function rememberMessageId(id) {
-  seenMessageIds.add(id);
-  // auto clear after 10 minutes
-  setTimeout(() => seenMessageIds.delete(id), 10 * 60 * 1000).unref?.();
-}
+// =====================
+// Routes
+// =====================
+app.get("/", (req, res) => res.status(200).send("OK"));
 
-/* -------------------- Notify ADMIN (DM) -------------------- */
-async function notifyAdmin(text) {
-  return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
-}
-
-/* -------------------- Webhook -------------------- */
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  // Respond fast to avoid LINE retry
+  // ตอบ 200 ให้เร็ว (กัน LINE timeout)
   res.sendStatus(200);
 
   const events = req.body?.events || [];
-  const baseUrl = buildPublicBaseUrl(req);
+  console.log("📩 Webhook triggered. Events:", events.length);
 
   for (const event of events) {
     try {
-      // --------- Only handle image messages ----------
-      if (event.type !== "message" || event.message?.type !== "image") continue;
-
-      const srcType = event.source?.type; // group/room/user
-      const messageId = event.message.id;
-
-      // Dedupe
-      if (seenMessageIds.has(messageId)) {
-        console.log("⚠️ Duplicate message ignored:", messageId);
-        continue;
-      }
-      rememberMessageId(messageId);
-
-      // Prepare folder
-      const folderName = await getSourceFolder(event);
-      const targetDir = path.join(baseImagesDir, folderName);
-      if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-
-      // Get image content stream
-      const stream = await client.getMessageContent(messageId);
-
-      // Detect extension (best-effort)
-      const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
-      const ext =
-        ct.includes("png") ? "png" :
-        ct.includes("jpeg") ? "jpg" :
-        ct.includes("jpg") ? "jpg" :
-        ct.includes("webp") ? "webp" :
-        "jpg";
-
-      const fileName = makeFileName(messageId, ext);
-      const filePath = path.join(targetDir, fileName);
-
-      await saveStreamToFile(stream, filePath);
-      console.log("✅ Saved:", filePath);
-
-      // Build view URL (optional)
-      const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(fileName)}`;
-      const viewUrl = IMAGE_VIEW_TOKEN
-        ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
-        : `${baseUrl}${viewPath}`;
-
-      // --------- Silent in group/room ----------
-      // Always notify admin when image comes from group/room.
-      if (srcType === "group" || srcType === "room") {
-        const msg =
-          `📸 มีรูปถูกส่งเข้ามา\n` +
-          `ที่: ${sourceLabel(event)}\n` +
-          `ผู้ส่ง: ${event.source?.userId || "-"}\n` +
-          `โฟลเดอร์: ${folderName}\n` +
-          `ไฟล์: ${fileName}\n` +
-          `ดูรูป: ${viewUrl}`;
-
-        await notifyAdmin(msg);
-        // DO NOT reply to group/room
-        continue;
-      }
-
-      // --------- Private chat ----------
-      // You can choose to reply or not. (Doesn't violate "silent in group")
-      // If you want "never auto reply anywhere", comment out the replyMessage below.
-      if (srcType === "user" && event.replyToken) {
+      // 1) join/follow: ทักทาย
+      if (event.type === "join" || event.type === "follow") {
         await client.replyMessage(event.replyToken, [
-          { type: "text", text: "✅ บันทึกรูปแล้วครับ" },
+          { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว ส่งรูปมาได้เลย" },
         ]);
+        console.log("✅ Replied welcome for:", event.type, event.source);
+        continue;
       }
 
-      // (Optional) also notify admin even for private images:
-      // await notifyAdmin(`📸 Private image saved: ${fileName}\n${viewUrl}`);
+      // 2) ข้อความเทส
+      if (event.type === "message" && event.message?.type === "text") {
+        await client.replyMessage(event.replyToken, [
+          { type: "text", text: "✅ เห็นข้อความแล้วครับ ส่งรูปมาได้เลย" },
+        ]);
+        continue;
+      }
+
+      // 3) รับรูป
+      if (event.type === "message" && event.message?.type === "image") {
+        const messageId = event.message.id;
+        const folderName = await getSourceFolder(event);
+
+        const targetDir = path.join(baseImagesDir, folderName);
+        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+
+        const fileName = makeFileName(messageId);
+        const filePath = path.join(targetDir, fileName);
+
+        console.log("📷 Image received:", messageId, "->", folderName);
+
+        // reply ทันที (กัน replyToken หมดอายุ) — ใช้ได้ครั้งเดียว
+        if (event.replyToken) {
+          await client.replyMessage(event.replyToken, [
+            { type: "text", text: "📥 รับรูปแล้วครับ กำลังบันทึก..." },
+          ]);
+        }
+
+        // โหลดรูปจาก LINE และบันทึกไฟล์
+        const stream = await client.getMessageContent(messageId);
+        await saveStreamToFile(stream, filePath);
+
+        console.log("✅ Image saved:", filePath);
+
+        // แจ้ง “บันทึกเสร็จ” (ต้องใช้ push เพราะ replyToken ใช้ไปแล้ว)
+        const to = event.source?.userId || event.source?.groupId || event.source?.roomId;
+        if (to) {
+          await client.pushMessage(to, [
+            {
+              type: "text",
+              text: `✅ บันทึกรูปเรียบร้อย\nโฟลเดอร์: ${folderName}\nไฟล์: ${fileName}`,
+            },
+          ]);
+        }
+
+        continue;
+      }
+
+      // event อื่นๆ
+      // console.log("ℹ️ Event type:", event.type);
     } catch (err) {
-      console.error("❌ Error:", err?.message || err);
-      try {
-        await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err)}`);
-      } catch (_) {}
+      console.error("❌ Error:", err);
+      console.error("LINE API error body:", err?.originalError?.response?.data);
     }
   }
 });
 
-/* -------------------- Start -------------------- */
+// =====================
+// Start
+// =====================
 const PORT = Number(process.env.PORT || 3001);
-app.listen(PORT, () => console.log(`🚀 SavePhotoBot running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
