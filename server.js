@@ -1,6 +1,3 @@
-//te2Vfvwg4Qe7IbDYgQRPZrn9k5rCTVRP7EaEPgudeGVAVsJwwJquX5mh6+dZMGc4nCftCN7RVbBW9OmH++bZQ4Lye7nldVedlmja3O58c4suHUP/aDnswixvrgbGqZyeHH6+MLPLM0OCjKyOWV35kAdB04t89/1O/w1cDnyilFU=
-//f82f6612b4ca51cee0cefafdd641f225
-
 require("dotenv").config();
 
 const express = require("express");
@@ -9,10 +6,6 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/webhook", (req, res) => res.status(200).send("OK"));
-
 
 const config = {
   channelAccessToken: process.env.LINE_ACCESS_TOKEN,
@@ -49,7 +42,6 @@ function makeFileName(messageId) {
 }
 
 function sanitizeFolderName(name) {
-  // กันอักขระต้องห้ามใน Windows + ย่อความยาว
   return String(name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
     .replace(/\s+/g, " ")
@@ -71,30 +63,28 @@ function saveStreamToFile(stream, filePath) {
 // Cache: group/room name
 // =====================
 const nameCache = new Map(); // key -> { name, ts }
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ชั่วโมง
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 ชม.
 
 async function getGroupOrRoomName(source) {
   if (!source?.type) return null;
 
-  // GROUP
   if (source.type === "group" && source.groupId) {
     const key = `group:${source.groupId}`;
     const cached = nameCache.get(key);
     if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
 
-    const summary = await client.getGroupSummary(source.groupId); // { groupId, groupName, pictureUrl }
+    const summary = await client.getGroupSummary(source.groupId);
     const name = sanitizeFolderName(summary.groupName || "UnknownGroup");
     nameCache.set(key, { name, ts: Date.now() });
     return name;
   }
 
-  // ROOM
   if (source.type === "room" && source.roomId) {
     const key = `room:${source.roomId}`;
     const cached = nameCache.get(key);
     if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
 
-    const summary = await client.getRoomSummary(source.roomId); // { roomId, roomName, pictureUrl }
+    const summary = await client.getRoomSummary(source.roomId);
     const name = sanitizeFolderName(summary.roomName || "UnknownRoom");
     nameCache.set(key, { name, ts: Date.now() });
     return name;
@@ -124,12 +114,16 @@ async function getSourceFolder(event) {
 }
 
 // =====================
-// Routes
+// Health check
 // =====================
 app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/webhook", (req, res) => res.status(200).send("OK"));
 
+// =====================
+// Webhook
+// =====================
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  // ตอบ 200 ให้เร็ว (กัน LINE timeout)
+  // ตอบ 200 ให้เร็ว กัน LINE timeout
   res.sendStatus(200);
 
   const events = req.body?.events || [];
@@ -137,24 +131,24 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   for (const event of events) {
     try {
-      // 1) join/follow: ทักทาย
+      // ✅ ทักทายเฉพาะตอน add friend / join group (ถ้าอยากปิดอันนี้ด้วย บอกได้)
       if (event.type === "join" || event.type === "follow") {
-        await client.replyMessage(event.replyToken, [
-          { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว ส่งรูปมาได้เลย" },
-        ]);
+        if (event.replyToken) {
+          await client.replyMessage(event.replyToken, [
+            { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว ส่งรูปมาได้เลย" },
+          ]);
+        }
         console.log("✅ Replied welcome for:", event.type, event.source);
         continue;
       }
 
-      // 2) ข้อความเทส
+      // ❌ ตัดการตอบข้อความ text อัตโนมัติออก (ตามที่ขอ)
       if (event.type === "message" && event.message?.type === "text") {
-        await client.replyMessage(event.replyToken, [
-          { type: "text", text: "✅ เห็นข้อความแล้วครับ ส่งรูปมาได้เลย" },
-        ]);
+        // ไม่ตอบอะไร
         continue;
       }
 
-      // 3) รับรูป
+      // ✅ รับรูป + บันทึก + ตอบกลับ “หลังบันทึกเสร็จ” (ตอบครั้งเดียว)
       if (event.type === "message" && event.message?.type === "image") {
         const messageId = event.message.id;
         const folderName = await getSourceFolder(event);
@@ -167,23 +161,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
         console.log("📷 Image received:", messageId, "->", folderName);
 
-        // reply ทันที (กัน replyToken หมดอายุ) — ใช้ได้ครั้งเดียว
-        if (event.replyToken) {
-          await client.replyMessage(event.replyToken, [
-            { type: "text", text: "📥 รับรูปแล้วครับ กำลังบันทึก..." },
-          ]);
-        }
-
-        // โหลดรูปจาก LINE และบันทึกไฟล์
         const stream = await client.getMessageContent(messageId);
         await saveStreamToFile(stream, filePath);
 
         console.log("✅ Image saved:", filePath);
 
-        // แจ้ง “บันทึกเสร็จ” (ต้องใช้ push เพราะ replyToken ใช้ไปแล้ว)
-        const to = event.source?.userId || event.source?.groupId || event.source?.roomId;
-        if (to) {
-          await client.pushMessage(to, [
+        // ตอบกลับหลังเซฟเสร็จ (ไม่มีข้อความ “กำลังบันทึก...” แล้ว)
+        if (event.replyToken) {
+          await client.replyMessage(event.replyToken, [
             {
               type: "text",
               text: `✅ บันทึกรูปเรียบร้อย\nโฟลเดอร์: ${folderName}\nไฟล์: ${fileName}`,
@@ -194,8 +179,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // event อื่นๆ
-      // console.log("ℹ️ Event type:", event.type);
+      // event อื่น ๆ ไม่ตอบ
     } catch (err) {
       console.error("❌ Error:", err);
       console.error("LINE API error body:", err?.originalError?.response?.data);
