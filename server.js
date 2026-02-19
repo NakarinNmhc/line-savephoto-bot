@@ -149,35 +149,28 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
 
       // ✅ รับรูป + บันทึก + ตอบกลับ “หลังบันทึกเสร็จ” (ตอบครั้งเดียว)
-      if (event.type === "message" && event.message?.type === "image") {
-        const messageId = event.message.id;
-        const folderName = await getSourceFolder(event);
+     // 3) รับรูป
+if (event.type === "message" && event.message?.type === "image") {
+  const messageId = event.message.id;
+  const folderName = await getSourceFolder(event);
 
-        const targetDir = path.join(baseImagesDir, folderName);
-        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+  const targetDir = path.join(baseImagesDir, folderName);
+  if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
-        const fileName = makeFileName(messageId);
-        const filePath = path.join(targetDir, fileName);
+  const fileName = makeFileName(messageId);
+  const filePath = path.join(targetDir, fileName);
 
-        console.log("📷 Image received:", messageId, "->", folderName);
+  console.log("📷 Image received:", messageId, "->", folderName);
 
-        const stream = await client.getMessageContent(messageId);
-        await saveStreamToFile(stream, filePath);
+  const stream = await client.getMessageContent(messageId);
+  await saveStreamToFile(stream, filePath);
 
-        console.log("✅ Image saved:", filePath);
+  console.log("✅ Image saved:", filePath);
 
-        // ตอบกลับหลังเซฟเสร็จ (ไม่มีข้อความ “กำลังบันทึก...” แล้ว)
-        if (event.replyToken) {
-          await client.replyMessage(event.replyToken, [
-            {
-              type: "text",
-              text: `✅ บันทึกรูปเรียบร้อย\nโฟลเดอร์: ${folderName}\nไฟล์: ${fileName}`,
-            },
-          ]);
-        }
+  // ❌ ลบ/ไม่ต้องมี replyMessage / pushMessage ใดๆ
+  continue;
+}
 
-        continue;
-      }
 
       // event อื่น ๆ ไม่ตอบ
     } catch (err) {
