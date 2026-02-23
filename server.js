@@ -194,7 +194,7 @@ async function msPostForm(url, data) {
 
 // Get access token from refresh token (consumers = OneDrive Personal)
 async function getGraphAccessToken() {
-  const tokenUrl = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+  const tokenUrl = "https://login.microsoftonline.com/9698a484-4077-4fa6-b110-1b8ced99bd2d/oauth2/v2.0/token";
   const tok = await msPostForm(tokenUrl, {
     client_id: MS_CLIENT_ID,
     grant_type: "refresh_token",
