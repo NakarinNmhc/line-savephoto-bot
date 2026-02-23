@@ -1,11 +1,27 @@
 /**
- * SavePhotoBot - Final server.js (Render-ready + OneDrive Personal + Date folders)
+ * SavePhotoBot - server.js (Render-ready + OneDrive ORG + Date folders + Logs)
  * Requirements:
  * - Silent in group/room (NO replyMessage, NO pushMessage to group/room)
- * - Save images locally into /images/<source-folder>/<YYYY-MM-DD> (optional, for debug)
- * - Upload images to OneDrive Personal (Microsoft Graph)
+ * - Save images locally into /images/<source-folder>/<YYYY-MM-DD> (optional debug)
+ * - Upload images to OneDrive (Microsoft Graph) using ORG tenant refresh token
  * - Notify ADMIN_USER_ID (DM) always when image arrives from group/room (with OneDrive link)
  * - Optional static route /images for viewing with IMAGE_VIEW_TOKEN
+ *
+ * ENV required:
+ *   LINE_ACCESS_TOKEN
+ *   LINE_CHANNEL_SECRET
+ *   ADMIN_USER_ID
+ *
+ * OneDrive ORG:
+ *   MS_TENANT                 (Directory/Tenant ID)
+ *   MS_CLIENT_ID              (Application/Client ID)
+ *   MS_REFRESH_TOKEN          (Refresh token from device code flow AFTER admin consent)
+ *   MS_SCOPES                 (recommended: "offline_access User.Read Files.ReadWrite.All")
+ *   ONEDRIVE_BASE_PATH        (default: "SavePhotoBot")
+ *
+ * Optional:
+ *   IMAGE_VIEW_TOKEN
+ *   DELETE_LOCAL_AFTER_UPLOAD (default "1")
  */
 
 require("dotenv").config();
@@ -29,10 +45,14 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 // Optional: protect image viewing route
 const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
 
-// OneDrive Personal (Graph)
+// OneDrive (Microsoft Graph) - ORG tenant
+const MS_TENANT = process.env.MS_TENANT; // Directory (tenant) ID
 const MS_CLIENT_ID = process.env.MS_CLIENT_ID; // Application (client) ID
-const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN; // refresh token (personal)
-const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBot"; // root folder name in OneDrive
+const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN; // refresh token (org user)
+const MS_SCOPES =
+  process.env.MS_SCOPES || "offline_access User.Read Files.ReadWrite.All";
+
+const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBot";
 
 // Optional: delete local file after upload
 const DELETE_LOCAL_AFTER_UPLOAD = (process.env.DELETE_LOCAL_AFTER_UPLOAD || "1") === "1";
@@ -46,8 +66,8 @@ if (!ADMIN_USER_ID) {
   console.error("❌ Missing env: ADMIN_USER_ID");
   process.exit(1);
 }
-if (!MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
-  console.error("❌ Missing env: MS_CLIENT_ID or MS_REFRESH_TOKEN (OneDrive Personal)");
+if (!MS_TENANT || !MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
+  console.error("❌ Missing env: MS_TENANT or MS_CLIENT_ID or MS_REFRESH_TOKEN");
   process.exit(1);
 }
 
@@ -76,13 +96,12 @@ function pad(n) {
 }
 
 // Date folder: YYYY-MM-DD (server timezone)
-// If your Render uses UTC and you want Thailand time, tell me and I'll adjust.
 function dateFolder() {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-// Requirement: date + messageId
+// Filename: date + messageId
 function makeFileName(messageId, ext = "jpg") {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${messageId}.${ext}`;
@@ -120,6 +139,18 @@ function sourceLabel(event) {
   return "UNKNOWN";
 }
 
+/**
+ * Graph path must not encode "/" as %2F
+ * So encode each segment only.
+ */
+function encodeGraphPath(p) {
+  return String(p || "")
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join("/");
+}
+
 /* -------------------- Cache: group name -------------------- */
 const nameCache = new Map(); // groupId -> { name, ts }
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -128,13 +159,13 @@ async function getGroupName(groupId) {
   const cached = nameCache.get(groupId);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
 
-  const summary = await client.getGroupSummary(groupId); // ✅ exists
+  const summary = await client.getGroupSummary(groupId);
   const name = sanitizeFolderName(summary.groupName || "UnknownGroup");
   nameCache.set(groupId, { name, ts: Date.now() });
   return name;
 }
 
-/* -------------------- Source folder (no room summary!) -------------------- */
+/* -------------------- Source folder -------------------- */
 async function getSourceFolder(event) {
   const s = event.source || {};
 
@@ -170,7 +201,7 @@ async function notifyAdmin(text) {
   return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
 }
 
-/* -------------------- OneDrive Personal (Microsoft Graph) -------------------- */
+/* -------------------- OneDrive / Microsoft Graph (ORG) -------------------- */
 let currentRefreshToken = MS_REFRESH_TOKEN;
 
 async function msPostForm(url, data) {
@@ -192,16 +223,17 @@ async function msPostForm(url, data) {
   return json;
 }
 
-// Get access token from refresh token (consumers = OneDrive Personal)
 async function getGraphAccessToken() {
-  const tokenUrl = "https://login.microsoftonline.com/9698a484-4077-4fa6-b110-1b8ced99bd2d/oauth2/v2.0/token";
+  const tokenUrl = `https://login.microsoftonline.com/${MS_TENANT}/oauth2/v2.0/token`;
+
   const tok = await msPostForm(tokenUrl, {
     client_id: MS_CLIENT_ID,
     grant_type: "refresh_token",
     refresh_token: currentRefreshToken,
-    scope: "offline_access User.Read Files.ReadWrite",
+    scope: MS_SCOPES, // ✅ must match the scopes used to obtain refresh token
   });
 
+  // MS may rotate refresh token
   if (tok.refresh_token && tok.refresh_token !== currentRefreshToken) {
     currentRefreshToken = tok.refresh_token;
     console.warn("⚠️ Microsoft rotated refresh token. Update MS_REFRESH_TOKEN on Render ASAP.");
@@ -210,36 +242,54 @@ async function getGraphAccessToken() {
   return tok.access_token;
 }
 
+async function graphFetch(url, { accessToken, method = "GET", headers = {}, body } = {}) {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...headers,
+    },
+    body,
+  });
+
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    json = null;
+  }
+
+  return { res, text, json };
+}
+
 // Ensure folder exists by creating each segment
 async function ensureOneDriveFolder(accessToken, folderPath) {
-  const parts = folderPath.split("/").filter(Boolean);
-  let currentPath = "";
+  const parts = String(folderPath).split("/").filter(Boolean);
+  let current = "";
 
   for (const p of parts) {
-    const nextPath = currentPath ? `${currentPath}/${p}` : p;
+    const next = current ? `${current}/${p}` : p;
 
-    // check exists
-    const checkUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(nextPath)}`;
-    const checkRes = await fetch(checkUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
-    if (checkRes.ok) {
-      currentPath = nextPath;
+    // Check exists
+    const checkUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(next)}`;
+    const check = await graphFetch(checkUrl, { accessToken });
+
+    if (check.res.ok) {
+      current = next;
       continue;
     }
 
-    // create folder under parent
-    const parentPath = currentPath; // "" or "a/b"
-    const createUrl = parentPath
-      ? `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(parentPath)}:/children`
+    // Create under parent
+    const parent = current; // "" or "a/b"
+    const createUrl = parent
+      ? `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(parent)}:/children`
       : `https://graph.microsoft.com/v1.0/me/drive/root/children`;
 
-    const createRes = await fetch(createUrl, {
+    const create = await graphFetch(createUrl, {
+      accessToken,
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name: p,
         folder: {},
@@ -247,52 +297,48 @@ async function ensureOneDriveFolder(accessToken, folderPath) {
       }),
     });
 
-    if (!createRes.ok) {
-      const err = await createRes.text();
-      if (!err.includes("nameAlreadyExists")) {
-        throw new Error(`Create folder failed (${nextPath}): ${err}`);
+    // If already exists due to race, ignore
+    if (!create.res.ok) {
+      const msg = create.text || "";
+      if (!msg.includes("nameAlreadyExists")) {
+        throw new Error(`Create folder failed (${next}): ${create.text}`);
       }
     }
 
-    currentPath = nextPath;
+    current = next;
   }
 }
 
 // Small upload (<=4MB): PUT content
 async function uploadSmall(accessToken, oneDrivePath, buffer, contentType) {
-  const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(oneDrivePath)}:/content`;
-  const res = await fetch(url, {
+  const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}:/content`;
+  const { res, text, json } = await graphFetch(url, {
+    accessToken,
     method: "PUT",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": contentType || "application/octet-stream",
-    },
+    headers: { "Content-Type": contentType || "application/octet-stream" },
     body: buffer,
   });
-  if (!res.ok) throw new Error(`Upload small failed: ${await res.text()}`);
-  return res.json(); // includes webUrl
+
+  if (!res.ok) throw new Error(`Upload small failed: ${text}`);
+  return json || {};
 }
 
 // Large upload (Create upload session + chunk)
-async function uploadLarge(accessToken, oneDrivePath, buffer, contentType) {
-  const createUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(oneDrivePath)}:/createUploadSession`;
-
-  const createRes = await fetch(createUrl, {
+async function uploadLarge(accessToken, oneDrivePath, buffer) {
+  const createUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}:/createUploadSession`;
+  const created = await graphFetch(createUrl, {
+    accessToken,
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      item: { "@microsoft.graph.conflictBehavior": "rename" },
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename" } }),
   });
 
-  if (!createRes.ok) throw new Error(`CreateUploadSession failed: ${await createRes.text()}`);
-  const session = await createRes.json();
-  const uploadUrl = session.uploadUrl;
+  if (!created.res.ok) throw new Error(`CreateUploadSession failed: ${created.text}`);
+  const uploadUrl = created.json?.uploadUrl;
+  if (!uploadUrl) throw new Error("CreateUploadSession: missing uploadUrl");
 
-  const chunkSize = 5 * 1024 * 1024; // multiple of 320 KiB
+  // chunk size must be multiple of 320 KiB. Use 5 MiB.
+  const chunkSize = 5 * 1024 * 1024;
   const total = buffer.length;
 
   let start = 0;
@@ -305,25 +351,25 @@ async function uploadLarge(accessToken, oneDrivePath, buffer, contentType) {
       headers: {
         "Content-Length": String(chunk.length),
         "Content-Range": `bytes ${start}-${end - 1}/${total}`,
-        "Content-Type": contentType || "application/octet-stream",
       },
       body: chunk,
     });
 
+    // 202/201 ok; 200 ok
     if (!(res.status === 200 || res.status === 201 || res.status === 202)) {
-      throw new Error(`Chunk upload failed (${start}-${end - 1}): ${await res.text()}`);
+      const text = await res.text();
+      throw new Error(`Chunk upload failed (${start}-${end - 1}): ${text}`);
     }
 
     start = end;
   }
 
   // Query final item by path to get webUrl
-  const itemRes = await fetch(
-    `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeURIComponent(oneDrivePath)}`,
-    { headers: { Authorization: `Bearer ${accessToken}` } }
-  );
-  if (!itemRes.ok) throw new Error(`Fetch uploaded item failed: ${await itemRes.text()}`);
-  return itemRes.json();
+  const itemUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}`;
+  const item = await graphFetch(itemUrl, { accessToken });
+
+  if (!item.res.ok) throw new Error(`Fetch uploaded item failed: ${item.text}`);
+  return item.json || {};
 }
 
 async function uploadToOneDrive({ folderName, fileName, localFilePath, contentType }) {
@@ -340,7 +386,7 @@ async function uploadToOneDrive({ folderName, fileName, localFilePath, contentTy
   const item =
     buf.length <= FOUR_MB
       ? await uploadSmall(accessToken, oneDrivePath, buf, contentType)
-      : await uploadLarge(accessToken, oneDrivePath, buf, contentType);
+      : await uploadLarge(accessToken, oneDrivePath, buf);
 
   return {
     webUrl: item.webUrl || null,
@@ -421,7 +467,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       await saveStreamToFile(stream, filePath);
       console.log("✅ Saved local:", filePath);
 
-      // local view url (optional)  ✅ include day folder
+      // local view url (optional)
       const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(fileName)}`;
       const localViewUrl = IMAGE_VIEW_TOKEN
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
@@ -433,7 +479,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ext === "webp" ? "image/webp" :
         "image/jpeg";
 
-      // ✅ OneDrive path: SavePhotoBot/<folderName>/<YYYY-MM-DD>/<fileName>
+      // OneDrive path: SavePhotoBot/<folderName>/<YYYY-MM-DD>/<fileName>
       const up = await uploadToOneDrive({
         folderName: `${folderName}/${day}`,
         fileName,
@@ -456,6 +502,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           `Local: ${localViewUrl}`;
 
         await notifyAdmin(msg);
+
+        // IMPORTANT: Silent in group/room -> no reply, no push to group/room
       } else {
         // Private chat (optional)
         if (srcType === "user" && event.replyToken) {
@@ -465,7 +513,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         }
       }
 
-      // delete local file (optional) ✅ cleanup day folder and parent folder
+      // delete local file (optional)
       if (DELETE_LOCAL_AFTER_UPLOAD) {
         try {
           fs.unlinkSync(filePath);
@@ -485,6 +533,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
     } catch (err) {
       console.error("❌ Error:", err?.message || err);
       console.error("LINE API error body:", err?.originalError?.response?.data);
+
+      // Best-effort admin notify
       try {
         await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err).slice(0, 900)}`);
       } catch (_) {}
