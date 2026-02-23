@@ -608,6 +608,13 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   for (const event of events) {
     try {
+console.log("ADMIN-CHECK:", {
+  srcType: event.source?.type,
+  userId: event.source?.userId,
+  groupId: event.source?.groupId,
+  roomId: event.source?.roomId,
+});
+
       const srcType = event.source?.type;
 
       // Silent policy
