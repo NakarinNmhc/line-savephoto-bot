@@ -1,10 +1,9 @@
 /**
- * SavePhotoBot - Production-ready (Render)
- * - Silent in group/room
- * - Save image -> OneDrive Personal (Microsoft Graph)
- * - Notify ADMIN (DM) always when image from group/room
- * - Queue + Retry + Backoff + Token cache
- * - DM commands: help, status, last, folders
+ * SavePhotoBot - server.js (Render-ready) + OneDrive Personal upload
+ * - Silent in group/room: NO replyMessage, NO pushMessage to group/room
+ * - Upload images to OneDrive: /SavePhotoBot/<folderName>/<fileName>
+ * - Always notify ADMIN_USER_ID (DM) when image arrives from group/room
+ * - Logs every incoming event so you know webhook is working
  */
 
 require("dotenv").config();
@@ -14,46 +13,39 @@ const line = require("@line/bot-sdk");
 const fs = require("fs");
 const path = require("path");
 
-// Node 22 has global fetch
+// Node 18+ has fetch built-in (Render uses Node 22 OK)
 const app = express();
-app.set("trust proxy", true);
 
-/* -------------------- Basic routes (health for Render) -------------------- */
-const STARTED_AT = Date.now();
+/* -------------------- Health routes -------------------- */
 app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true, uptimeSec: Math.floor((Date.now() - STARTED_AT) / 1000) }));
-app.get("/healthz", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.status(200).send("OK"));
 
 /* -------------------- ENV -------------------- */
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 
-const MS_TENANT = process.env.MS_TENANT || "consumers"; // OneDrive Personal
-const MS_CLIENT_ID = process.env.MS_CLIENT_ID;
-const MS_CLIENT_SECRET = process.env.MS_CLIENT_SECRET || ""; // optional
-const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN;
+const MS_CLIENT_ID = process.env.MS_CLIENT_ID;              // from Azure App Registration
+const MS_CLIENT_SECRET = process.env.MS_CLIENT_SECRET || ""; // optional (public client may not have)
+const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN;      // your refresh token
 
-const BOT_ROOT_FOLDER = process.env.BOT_ROOT_FOLDER || "SavePhotoBot";
-const UPLOAD_CONCURRENCY = Math.max(1, Number(process.env.UPLOAD_CONCURRENCY || 2));
-const UPLOAD_MAX_RETRY = Math.max(1, Number(process.env.UPLOAD_MAX_RETRY || 5));
-
-// Optional local image viewer (dev only)
-const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
+// For OneDrive Personal use "consumers"
+const MS_TENANT = process.env.MS_TENANT || "consumers"; // keep "consumers" for personal
 
 /* -------------------- Validate env -------------------- */
-if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
-  console.error("❌ Missing env: LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
-  process.exit(1);
+function must(name, v) {
+  if (!v) {
+    console.error(`❌ Missing env: ${name}`);
+    process.exit(1);
+  }
 }
-if (!ADMIN_USER_ID) {
-  console.error("❌ Missing env: ADMIN_USER_ID");
-  process.exit(1);
-}
-if (!MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
-  console.error("❌ Missing env: MS_CLIENT_ID or MS_REFRESH_TOKEN (OneDrive Personal)");
-  process.exit(1);
-}
+
+must("LINE_ACCESS_TOKEN", LINE_ACCESS_TOKEN);
+must("LINE_CHANNEL_SECRET", LINE_CHANNEL_SECRET);
+must("ADMIN_USER_ID", ADMIN_USER_ID);
+
+must("MS_CLIENT_ID", MS_CLIENT_ID);
+must("MS_REFRESH_TOKEN", MS_REFRESH_TOKEN);
 
 /* -------------------- LINE client -------------------- */
 const config = {
@@ -62,29 +54,21 @@ const config = {
 };
 const client = new line.Client(config);
 
-/* -------------------- Local storage (optional) -------------------- */
-const baseImagesDir = path.join(__dirname, "images");
-if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true });
-
-// Express 5 safe static route (avoid "/images/*")
-app.get(/^\/images\/.*/, (req, res, next) => {
-  if (!IMAGE_VIEW_TOKEN) return next(); // dev open
-  if (req.query.token !== IMAGE_VIEW_TOKEN) return res.sendStatus(403);
-  return next();
-});
-app.use("/images", express.static(baseImagesDir));
+/* -------------------- Local temp storage (optional) -------------------- */
+const tmpDir = path.join(__dirname, "tmp");
+if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
 /* -------------------- Helpers -------------------- */
 function pad(n) {
   return String(n).padStart(2, "0");
 }
-function todayStr(d = new Date()) {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
+
+// date + messageId (requirement)
 function makeFileName(messageId, ext = "jpg") {
-  // Requirement: date + messageId
-  return `${todayStr()}_${messageId}.${ext}`;
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${messageId}.${ext}`;
 }
+
 function sanitizeFolderName(name) {
   return String(name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -92,30 +76,23 @@ function sanitizeFolderName(name) {
     .trim()
     .slice(0, 80);
 }
-function buildPublicBaseUrl(req) {
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  return `${proto}://${host}`;
+
+function saveStreamToFile(stream, filePath) {
+  return new Promise((resolve, reject) => {
+    const w = fs.createWriteStream(filePath);
+    stream.pipe(w);
+    w.on("finish", resolve);
+    w.on("error", reject);
+    stream.on("error", reject);
+  });
 }
+
 function sourceLabel(event) {
   const s = event.source || {};
   if (s.type === "group") return `GROUP (${(s.groupId || "").slice(-6)})`;
   if (s.type === "room") return `ROOM (${(s.roomId || "").slice(-6)})`;
   if (s.type === "user") return `PRIVATE (${(s.userId || "").slice(-6)})`;
   return "UNKNOWN";
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-function isRetryableStatus(status) {
-  return status === 429 || (status >= 500 && status <= 599);
-}
-
-/* -------------------- Dedupe (LINE webhook retries) -------------------- */
-const seenMessageIds = new Set();
-function rememberMessageId(id) {
-  seenMessageIds.add(id);
-  setTimeout(() => seenMessageIds.delete(id), 10 * 60 * 1000).unref?.();
 }
 
 /* -------------------- Cache: group name -------------------- */
@@ -126,14 +103,16 @@ async function getGroupName(groupId) {
   const cached = nameCache.get(groupId);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.name;
 
-  const summary = await client.getGroupSummary(groupId);
+  const summary = await client.getGroupSummary(groupId); // {groupId, groupName, pictureUrl}
   const name = sanitizeFolderName(summary.groupName || "UnknownGroup");
   nameCache.set(groupId, { name, ts: Date.now() });
   return name;
 }
 
+/* -------------------- Source folder -------------------- */
 async function getSourceFolder(event) {
   const s = event.source || {};
+
   if (s.type === "user") return "private";
 
   if (s.type === "group" && s.groupId) {
@@ -141,7 +120,7 @@ async function getSourceFolder(event) {
     try {
       const name = await getGroupName(s.groupId);
       return `group_${name}_${tail}`;
-    } catch {
+    } catch (_) {
       return `group_${tail}`;
     }
   }
@@ -154,26 +133,27 @@ async function getSourceFolder(event) {
   return "unknown";
 }
 
+/* -------------------- Dedupe (LINE webhook retry) -------------------- */
+const seenMessageIds = new Set();
+function rememberMessageId(id) {
+  seenMessageIds.add(id);
+  setTimeout(() => seenMessageIds.delete(id), 10 * 60 * 1000).unref?.();
+}
+
 /* -------------------- Notify admin (DM) -------------------- */
 async function notifyAdmin(text) {
   return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
 }
 
-/* ============================================================
- *  OneDrive (Microsoft Graph) - Token + Folder + Upload
- * ============================================================ */
+/* =========================================================
+   OneDrive (Microsoft Graph) helpers
+   ========================================================= */
+let cachedAccessToken = "";
+let cachedExpMs = 0;
 
-/** In-memory access token cache */
-const msTokenCache = {
-  accessToken: "",
-  expiresAt: 0, // epoch ms
-};
-
-async function getMsAccessToken() {
-  // reuse if still valid (buffer 60s)
-  if (msTokenCache.accessToken && Date.now() < msTokenCache.expiresAt - 60_000) {
-    return msTokenCache.accessToken;
-  }
+async function getAccessToken() {
+  // reuse until close to expire
+  if (cachedAccessToken && Date.now() < cachedExpMs - 60_000) return cachedAccessToken;
 
   const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(MS_TENANT)}/oauth2/v2.0/token`;
 
@@ -182,402 +162,203 @@ async function getMsAccessToken() {
   if (MS_CLIENT_SECRET) body.set("client_secret", MS_CLIENT_SECRET);
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", MS_REFRESH_TOKEN);
-
-  // IMPORTANT: For v2, scope is recommended. Use Graph default + offline_access to keep refresh stable.
-  // (Some setups work without scope; but this is safer)
-  body.set("scope", "offline_access https://graph.microsoft.com/.default");
+  body.set("scope", "offline_access Files.ReadWrite");
 
   const res = await fetch(tokenUrl, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
   });
 
   const json = await res.json();
   if (!res.ok) {
-    // don't log tokens
-    throw new Error(`MS token error: ${json?.error || res.status} - ${json?.error_description || "unknown"}`);
+    throw new Error(`Token error: ${JSON.stringify(json, null, 2)}`);
   }
 
-  msTokenCache.accessToken = json.access_token;
-  msTokenCache.expiresAt = Date.now() + Number(json.expires_in || 3600) * 1000;
-  return msTokenCache.accessToken;
+  cachedAccessToken = json.access_token;
+  cachedExpMs = Date.now() + (Number(json.expires_in || 3600) * 1000);
+  return cachedAccessToken;
 }
 
-async function graphFetch(url, options = {}, retryLeft = UPLOAD_MAX_RETRY) {
-  const token = await getMsAccessToken();
+async function graphFetch(url, options = {}) {
+  const token = await getAccessToken();
   const headers = {
     ...(options.headers || {}),
     Authorization: `Bearer ${token}`,
   };
 
   const res = await fetch(url, { ...options, headers });
-
-  if (res.status === 401 && retryLeft > 0) {
-    // token expired or revoked -> clear cache and retry once
-    msTokenCache.accessToken = "";
-    msTokenCache.expiresAt = 0;
-    return graphFetch(url, options, retryLeft - 1);
-  }
-
-  if (isRetryableStatus(res.status) && retryLeft > 0) {
-    const wait = Math.min(30_000, 500 * Math.pow(2, (UPLOAD_MAX_RETRY - retryLeft))); // backoff
-    await sleep(wait);
-    return graphFetch(url, options, retryLeft - 1);
-  }
-
   return res;
 }
 
-/** Ensure folder path exists under root: SavePhotoBot/<folderName>/<date> */
-async function ensureOneDriveFolderPath(pathParts) {
-  // pathParts is array like ["SavePhotoBot", folderName, "YYYY-MM-DD"]
-  // We'll create step by step using children + conflictBehavior=fail
-  // Use special root: /me/drive/root
+// Create folder if not exists under parentId
+async function ensureChildFolder(parentId, folderName) {
+  // 1) try list children & find folder
+  const listUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children?$select=id,name,folder`;
+  const listRes = await graphFetch(listUrl);
+  const listJson = await listRes.json();
+  if (!listRes.ok) throw new Error(`List children error: ${JSON.stringify(listJson, null, 2)}`);
 
-  // Start from root item
-  let parentId = null; // null = drive root
+  const found = (listJson.value || []).find(
+    (it) => it?.folder && it?.name?.toLowerCase() === folderName.toLowerCase()
+  );
+  if (found?.id) return found.id;
 
-  for (const part of pathParts) {
-    const name = part;
+  // 2) create folder
+  const createUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children`;
+  const createRes = await graphFetch(createUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: folderName,
+      folder: {},
+      "@microsoft.graph.conflictBehavior": "rename",
+    }),
+  });
+  const createJson = await createRes.json();
+  if (!createRes.ok) throw new Error(`Create folder error: ${JSON.stringify(createJson, null, 2)}`);
 
-    // 1) Check if folder exists
-    const encodedName = encodeURIComponent(name.replace(/'/g, "''"));
-    const listUrl = parentId
-      ? `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children?$filter=name eq '${encodedName}'`
-      : `https://graph.microsoft.com/v1.0/me/drive/root/children?$filter=name eq '${encodedName}'`;
-
-    // NOTE: filter with encodedName is tricky; simplest: list children and find by name would be heavy.
-    // Better approach: use path-based addressing:
-    // /me/drive/root:/SavePhotoBot:/children and then try create; if exists -> 409 and we then resolve by GET item
-    // We'll use path-based method for reliability:
-
-    const folderPath = pathPartsToGraphPath(pathParts.slice(0, pathParts.indexOf(part) + 1));
-    // Try GET item by path
-    const getUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${folderPath}`;
-    let getRes = await graphFetch(getUrl, { method: "GET" });
-
-    if (getRes.ok) {
-      const item = await getRes.json();
-      parentId = item.id;
-      continue;
-    }
-
-    // 2) Create folder under current parent
-    const createUrl = parentId
-      ? `https://graph.microsoft.com/v1.0/me/drive/items/${parentId}/children`
-      : `https://graph.microsoft.com/v1.0/me/drive/root/children`;
-
-    const createRes = await graphFetch(createUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        name,
-        folder: {},
-        "@microsoft.graph.conflictBehavior": "fail",
-      }),
-    });
-
-    if (createRes.ok) {
-      const created = await createRes.json();
-      parentId = created.id;
-      continue;
-    }
-
-    // If exists (409), GET again
-    if (createRes.status === 409) {
-      getRes = await graphFetch(getUrl, { method: "GET" });
-      if (!getRes.ok) {
-        const t = await safeReadText(getRes);
-        throw new Error(`Folder exists but cannot GET: ${getRes.status} ${t}`);
-      }
-      const item = await getRes.json();
-      parentId = item.id;
-      continue;
-    }
-
-    const txt = await safeReadText(createRes);
-    throw new Error(`Create folder failed: ${createRes.status} ${txt}`);
-  }
-
-  return parentId;
+  return createJson.id;
 }
 
-function pathPartsToGraphPath(parts) {
-  // join with / and encode each segment safely
-  return parts.map((p) => encodeURIComponent(p)).join("/");
+// Ensure full path /SavePhotoBot/<folderName> exists, return parent folder id
+async function ensureUploadFolder(folderName) {
+  // Root
+  const rootRes = await graphFetch("https://graph.microsoft.com/v1.0/me/drive/root?$select=id");
+  const rootJson = await rootRes.json();
+  if (!rootRes.ok) throw new Error(`Root error: ${JSON.stringify(rootJson, null, 2)}`);
+  const rootId = rootJson.id;
+
+  // /SavePhotoBot
+  const savePhotoBotId = await ensureChildFolder(rootId, "SavePhotoBot");
+
+  // /SavePhotoBot/<folderName>
+  const groupFolderId = await ensureChildFolder(savePhotoBotId, folderName);
+
+  return groupFolderId;
 }
 
-async function safeReadText(res) {
-  try {
-    return await res.text();
-  } catch {
-    return "";
-  }
-}
+// Upload file to OneDrive in given folderId
+async function uploadFileToOneDrive(folderId, fileName, buffer, contentType) {
+  // PUT /items/{folderId}:/{fileName}:/content
+  const putUrl = `https://graph.microsoft.com/v1.0/me/drive/items/${folderId}:/${encodeURIComponent(fileName)}:/content`;
 
-/** Upload small file (<4MB) using simple upload */
-async function uploadSmallFileToOneDrive(folderParts, fileName, buffer) {
-  const fullPath = pathPartsToGraphPath([...folderParts, fileName]);
-  const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${fullPath}:/content`;
-
-  const res = await graphFetch(url, {
+  const putRes = await graphFetch(putUrl, {
     method: "PUT",
-    headers: { "content-type": "application/octet-stream" },
+    headers: {
+      "Content-Type": contentType || "application/octet-stream",
+    },
     body: buffer,
   });
 
-  if (!res.ok) {
-    const txt = await safeReadText(res);
-    throw new Error(`Simple upload failed: ${res.status} ${txt}`);
-  }
-  return res.json();
-}
-
-/** Upload large file using upload session (recommended for LINE images that might be >4MB) */
-async function uploadLargeFileToOneDrive(folderParts, fileName, buffer) {
-  const fullPath = pathPartsToGraphPath([...folderParts, fileName]);
-  const createSessionUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${fullPath}:/createUploadSession`;
-
-  const sessionRes = await graphFetch(createSessionUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      item: {
-        "@microsoft.graph.conflictBehavior": "replace",
-        name: fileName,
-      },
-    }),
-  });
-
-  if (!sessionRes.ok) {
-    const txt = await safeReadText(sessionRes);
-    throw new Error(`Create upload session failed: ${sessionRes.status} ${txt}`);
-  }
-
-  const session = await sessionRes.json();
-  const uploadUrl = session.uploadUrl;
-
-  // Chunk upload
-  const chunkSize = 5 * 1024 * 1024; // 5MB
-  const total = buffer.length;
-
-  let start = 0;
-  while (start < total) {
-    const end = Math.min(total - 1, start + chunkSize - 1);
-    const chunk = buffer.subarray(start, end + 1);
-
-    const putRes = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Length": String(chunk.length),
-        "Content-Range": `bytes ${start}-${end}/${total}`,
-      },
-      body: chunk,
-    });
-
-    // 202 accepted = continue
-    if (putRes.status === 202) {
-      start = end + 1;
-      continue;
-    }
-
-    // 201/200 = finished
-    if (putRes.ok) {
-      return putRes.json();
-    }
-
-    // Retryable?
-    if (isRetryableStatus(putRes.status)) {
-      await sleep(1000);
-      continue;
-    }
-
-    const txt = await safeReadText(putRes);
-    throw new Error(`Chunk upload failed: ${putRes.status} ${txt}`);
-  }
-
-  throw new Error("Chunk upload ended unexpectedly");
-}
-
-/** Main upload: ensure folders then upload with correct method */
-async function uploadToOneDrive({ folderName, fileName, buffer }) {
-  const date = todayStr();
-  const folderParts = [BOT_ROOT_FOLDER, folderName, date];
-
-  // Ensure folder path exists
-  await ensureOneDriveFolderPath(folderParts);
-
-  // Choose upload strategy
-  const FOUR_MB = 4 * 1024 * 1024;
-  if (buffer.length <= FOUR_MB) {
-    return uploadSmallFileToOneDrive(folderParts, fileName, buffer);
-  }
-  return uploadLargeFileToOneDrive(folderParts, fileName, buffer);
-}
-
-/** Build a OneDrive "open" link (webUrl) from upload response */
-function extractWebUrl(uploadResp) {
-  return uploadResp?.webUrl || uploadResp?.["@microsoft.graph.downloadUrl"] || "";
-}
-
-/* ============================================================
- *  Queue / Concurrency (ข้อ 2)
- * ============================================================ */
-function createQueue(concurrency) {
-  let running = 0;
-  const queue = [];
-
-  const runNext = () => {
-    if (running >= concurrency) return;
-    const job = queue.shift();
-    if (!job) return;
-
-    running++;
-    job()
-      .catch(() => {})
-      .finally(() => {
-        running--;
-        runNext();
-      });
-  };
+  const putJson = await putRes.json();
+  if (!putRes.ok) throw new Error(`Upload error: ${JSON.stringify(putJson, null, 2)}`);
 
   return {
-    add(fn) {
-      return new Promise((resolve, reject) => {
-        queue.push(async () => {
-          try {
-            const out = await fn();
-            resolve(out);
-          } catch (e) {
-            reject(e);
-          }
-        });
-        runNext();
-      });
-    },
-    status() {
-      return { running, queued: queue.length, concurrency };
-    },
+    id: putJson.id,
+    name: putJson.name,
+    webUrl: putJson.webUrl,
   };
 }
 
-const uploadQueue = createQueue(UPLOAD_CONCURRENCY);
+/* -------------------- Keep "last upload" in memory -------------------- */
+let lastUpload = null; // { at, folderName, fileName, webUrl, source }
 
-/* ============================================================
- *  DM commands memory (ข้อ 5)
- * ============================================================ */
-const lastUploads = []; // newest last
-const LAST_LIMIT = 20;
+/* -------------------- Text commands (private only) -------------------- */
+async function handlePrivateTextCommand(event) {
+  const text = (event.message?.text || "").trim().toLowerCase();
+  if (!text) return;
 
-function pushLastUpload(item) {
-  lastUploads.push(item);
-  while (lastUploads.length > LAST_LIMIT) lastUploads.shift();
+  if (text === "help") {
+    await client.replyMessage(event.replyToken, [{
+      type: "text",
+      text:
+        "คำสั่ง SavePhotoBot:\n" +
+        "- help : ดูคำสั่ง\n" +
+        "- status : สถานะระบบ\n" +
+        "- last : ลิงก์รูปล่าสุด\n"
+    }]);
+    return;
+  }
+
+  if (text === "status") {
+    const msg =
+      "✅ SavePhotoBot ทำงานอยู่\n" +
+      "โหมด: silent ใน group/room\n" +
+      "Storage: OneDrive/SavePhotoBot/...";
+    await client.replyMessage(event.replyToken, [{ type: "text", text: msg }]);
+    return;
+  }
+
+  if (text === "last") {
+    if (!lastUpload) {
+      await client.replyMessage(event.replyToken, [{ type: "text", text: "ยังไม่มีรายการอัปโหลดล่าสุดครับ" }]);
+      return;
+    }
+    await client.replyMessage(event.replyToken, [{
+      type: "text",
+      text:
+        "🕒 ล่าสุด\n" +
+        `เวลา: ${lastUpload.at}\n` +
+        `ที่มา: ${lastUpload.source}\n` +
+        `โฟลเดอร์: ${lastUpload.folderName}\n` +
+        `ไฟล์: ${lastUpload.fileName}\n` +
+        `ลิงก์: ${lastUpload.webUrl || "-"}`
+    }]);
+    return;
+  }
 }
 
-/* -------------------- Webhook -------------------- */
+/* =========================================================
+   Webhook
+   ========================================================= */
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  // Reply fast to prevent LINE retry storm
+  // respond fast to avoid LINE retry storms
   res.sendStatus(200);
 
   const events = req.body?.events || [];
-  const baseUrl = buildPublicBaseUrl(req);
+
+  // ✅ LOG: show what came in (so you know webhook is working)
+  console.log("📩 Webhook IN | events =", events.length);
+  for (const e of events) {
+    console.log(
+      "   ->",
+      JSON.stringify({
+        type: e.type,
+        messageType: e.message?.type,
+        messageId: e.message?.id,
+        sourceType: e.source?.type,
+        groupIdTail: e.source?.groupId ? e.source.groupId.slice(-6) : undefined,
+        roomIdTail: e.source?.roomId ? e.source.roomId.slice(-6) : undefined,
+        userIdTail: e.source?.userId ? e.source.userId.slice(-6) : undefined,
+      })
+    );
+  }
 
   for (const event of events) {
-    const srcType = event.source?.type;
-
     try {
-      // ---- Silent policy ----
-      // Never reply in group/room for any event
+      const srcType = event.source?.type;
+
+      // Silent policy: never talk in group/room on join
       if (event.type === "join") continue;
 
-      // follow happens in private (user add friend)
+      // follow happens in private
       if (event.type === "follow") {
         if (srcType === "user" && event.replyToken) {
           await client.replyMessage(event.replyToken, [
-            { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว\nพิมพ์ help เพื่อดูคำสั่ง" },
+            { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว ส่งรูปมาได้เลย" },
           ]);
         }
         continue;
       }
 
-      // DM commands (only in private user)
-      if (event.type === "message" && srcType === "user" && event.message?.type === "text") {
-        const text = String(event.message.text || "").trim().toLowerCase();
-
-        if (!event.replyToken) continue;
-
-        if (text === "help") {
-          await client.replyMessage(event.replyToken, [{
-            type: "text",
-            text:
-              "คำสั่ง SavePhotoBot:\n" +
-              "- help : ดูคำสั่ง\n" +
-              "- status : สถานะระบบ/คิวอัปโหลด\n" +
-              "- last : ลิงก์รูปล่าสุด\n" +
-              "- folders : รายชื่อโฟลเดอร์บน OneDrive (ระดับแรก)\n"
-          }]);
-          continue;
-        }
-
-        if (text === "status") {
-          const q = uploadQueue.status();
-          await client.replyMessage(event.replyToken, [{
-            type: "text",
-            text:
-              `✅ Status\n` +
-              `Uptime: ${Math.floor((Date.now() - STARTED_AT) / 1000)}s\n` +
-              `Queue: running=${q.running}, queued=${q.queued}, concurrency=${q.concurrency}\n` +
-              `OneDrive root: ${BOT_ROOT_FOLDER}\n`
-          }]);
-          continue;
-        }
-
-        if (text === "last") {
-          if (lastUploads.length === 0) {
-            await client.replyMessage(event.replyToken, [{ type: "text", text: "ยังไม่มีรายการอัปโหลดล่าสุดครับ" }]);
-            continue;
-          }
-          const items = lastUploads.slice(-5).reverse();
-          const msg = items.map((it, i) =>
-            `${i + 1}) ${it.when}\nที่: ${it.source}\nโฟลเดอร์: ${it.folder}\nไฟล์: ${it.file}\nลิงก์: ${it.webUrl || "-"}`
-          ).join("\n\n");
-          await client.replyMessage(event.replyToken, [{ type: "text", text: msg }]);
-          continue;
-        }
-
-        if (text === "folders") {
-          // list folders under root folder on OneDrive
-          // GET /me/drive/root:/SavePhotoBot:/children
-          const rootPath = pathPartsToGraphPath([BOT_ROOT_FOLDER]);
-          const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${rootPath}:/children?$top=50`;
-          const r = await graphFetch(url, { method: "GET" });
-          if (!r.ok) {
-            const t = await safeReadText(r);
-            await client.replyMessage(event.replyToken, [{ type: "text", text: `❌ list folders failed: ${r.status} ${t}` }]);
-            continue;
-          }
-          const json = await r.json();
-          const names = (json.value || [])
-            .filter((x) => x.folder)
-            .map((x) => x.name)
-            .slice(0, 30);
-
-          await client.replyMessage(event.replyToken, [{
-            type: "text",
-            text: names.length
-              ? `📁 โฟลเดอร์ใน ${BOT_ROOT_FOLDER}:\n- ` + names.join("\n- ")
-              : `ยังไม่มีโฟลเดอร์ใน ${BOT_ROOT_FOLDER} ครับ`
-          }]);
-          continue;
-        }
-
-        // unknown command
-        await client.replyMessage(event.replyToken, [{ type: "text", text: "พิมพ์ help เพื่อดูคำสั่งที่ใช้ได้ครับ" }]);
+      // Text command in private
+      if (event.type === "message" && event.message?.type === "text" && srcType === "user") {
+        await handlePrivateTextCommand(event);
         continue;
       }
 
-      // Only handle image messages
+      // Only image messages
       if (event.type !== "message" || event.message?.type !== "image") continue;
 
       const messageId = event.message.id;
@@ -589,12 +370,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
       rememberMessageId(messageId);
 
+      // Determine folder
       const folderName = await getSourceFolder(event);
 
-      // Get content stream from LINE
+      // download from LINE -> temp file
       const stream = await client.getMessageContent(messageId);
-
-      // Detect ext by content-type (best-effort)
       const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
       const ext =
         ct.includes("png") ? "png" :
@@ -604,80 +384,66 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         "jpg";
 
       const fileName = makeFileName(messageId, ext);
+      const tempPath = path.join(tmpDir, fileName);
 
-      // Read stream into Buffer (needed for Graph upload)
-      const chunks = [];
-      await new Promise((resolve, reject) => {
-        stream.on("data", (c) => chunks.push(c));
-        stream.on("end", resolve);
-        stream.on("error", reject);
-      });
-      const buffer = Buffer.concat(chunks);
+      console.log("📷 Image received:", messageId, "source:", sourceLabel(event), "-> folder:", folderName);
 
-      // Optional local save (dev / debug)
-      try {
-        const targetDir = path.join(baseImagesDir, folderName);
-        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
-        fs.writeFileSync(path.join(targetDir, fileName), buffer);
-      } catch (_) {}
+      await saveStreamToFile(stream, tempPath);
 
-      // Queue upload to OneDrive (ข้อ 2 + 3)
-      const uploadResult = await uploadQueue.add(async () => {
-        // retry wrapper (ข้อ 3) - network/Graph errors
-        let lastErr = null;
+      // read file buffer
+      const buffer = await fs.promises.readFile(tempPath);
 
-        for (let attempt = 1; attempt <= UPLOAD_MAX_RETRY; attempt++) {
-          try {
-            const resp = await uploadToOneDrive({ folderName, fileName, buffer });
-            return resp;
-          } catch (e) {
-            lastErr = e;
-            const wait = Math.min(30_000, 800 * Math.pow(2, attempt - 1));
-            console.warn(`⚠️ Upload retry ${attempt}/${UPLOAD_MAX_RETRY}: ${e?.message || e}`);
-            await sleep(wait);
-          }
-        }
+      // ensure OneDrive folder path
+      console.log("☁️ OneDrive ensure folder:", `SavePhotoBot/${folderName}`);
+      const folderId = await ensureUploadFolder(folderName);
 
-        throw lastErr || new Error("Upload failed");
-      });
+      // upload to OneDrive
+      console.log("☁️ OneDrive uploading:", fileName);
+      const uploaded = await uploadFileToOneDrive(folderId, fileName, buffer, ct || "image/jpeg");
+      console.log("✅ OneDrive uploaded:", uploaded.webUrl);
 
-      const webUrl = extractWebUrl(uploadResult);
+      // cleanup temp
+      fs.promises.unlink(tempPath).catch(() => {});
 
-      pushLastUpload({
-        when: new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" }),
+      // save last upload
+      lastUpload = {
+        at: new Date().toISOString(),
+        folderName,
+        fileName,
+        webUrl: uploaded.webUrl,
         source: sourceLabel(event),
-        folder: `${BOT_ROOT_FOLDER}/${folderName}/${todayStr()}`,
-        file: fileName,
-        webUrl,
-      });
+      };
 
-      // Notify admin always when image from group/room (ข้อ 5)
+      // Group/Room -> notify admin only (silent in group/room)
       if (srcType === "group" || srcType === "room") {
         const msg =
           `📸 มีรูปถูกส่งเข้ามา\n` +
           `ที่: ${sourceLabel(event)}\n` +
-          `โฟลเดอร์: ${BOT_ROOT_FOLDER}/${folderName}/${todayStr()}\n` +
+          `โฟลเดอร์: ${folderName}\n` +
           `ไฟล์: ${fileName}\n` +
-          `OneDrive: ${webUrl || "(กำลังได้ลิงก์ไม่ได้)"}\n` +
-          `ขนาด: ${(buffer.length / 1024).toFixed(1)} KB`;
-
+          `OneDrive: ${uploaded.webUrl}`;
         await notifyAdmin(msg);
-
-        // IMPORTANT: Silent in group/room -> no reply, no push to group/room
         continue;
       }
 
-      // Private chat: optional confirm (คุณจะปิดก็ได้)
+      // Private -> reply confirm (so it won't be silent/quiet)
       if (srcType === "user" && event.replyToken) {
         await client.replyMessage(event.replyToken, [
-          { type: "text", text: `✅ อัปโหลดเข้า OneDrive แล้ว\n${webUrl ? `ลิงก์: ${webUrl}` : ""}`.trim() },
+          {
+            type: "text",
+            text:
+              `✅ อัปโหลดไป OneDrive แล้ว\n` +
+              `โฟลเดอร์: ${folderName}\n` +
+              `ไฟล์: ${fileName}\n` +
+              `ลิงก์: ${uploaded.webUrl}`,
+          },
         ]);
       }
     } catch (err) {
       console.error("❌ Error:", err?.message || err);
-      console.error("LINE API error body:", err?.originalError?.response?.data);
+      console.error("DETAIL:", err);
 
-      // notify admin on errors (best effort)
+      // try notify admin
       try {
         await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err)}`);
       } catch (_) {}
