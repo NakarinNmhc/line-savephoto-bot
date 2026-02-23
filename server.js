@@ -1,39 +1,11 @@
 /**
  * SavePhotoBot - server.js (Render-ready + SharePoint/OneDrive + Date folders + Logs)
- *
- * Goals:
- * - Silent in group/room (NO replyMessage, NO pushMessage to group/room)
- * - Save images locally into /images/<source-folder>/<YYYY-MM-DD> (optional debug)
- * - Upload images to SharePoint (Site Documents) OR OneDrive via Microsoft Graph (ORG tenant refresh token)
- * - Notify ADMIN_USER_ID (DM) always when image arrives from group/room (with link)
- *
- * ENV required:
- *   LINE_ACCESS_TOKEN
- *   LINE_CHANNEL_SECRET
- *   ADMIN_USER_ID
- *
- * Microsoft Graph (ORG delegated):
- *   MS_TENANT
- *   MS_CLIENT_ID
- *   MS_REFRESH_TOKEN
- *   MS_SCOPES (recommended: "offline_access User.Read Files.ReadWrite.All Sites.ReadWrite.All")
- *
- * Storage mode:
- *   STORAGE_MODE=sharepoint | onedrive   (default: sharepoint)
- *
- * SharePoint target (for sharepoint mode):
- *   SP_HOSTNAME=milestonesth.sharepoint.com
- *   SP_SITE_PATH=/sites/SavePhotoBot
- *   SP_DRIVE_NAME=Shared Documents   (optional; try "Documents" too)
- *   SP_DRIVE_ID=xxxxx (optional; if set, skip discovery and use directly - most stable)
- *
- * Folder structure inside target drive:
- *   ONEDRIVE_BASE_PATH/<source>/<YYYY-MM-DD>/<file>
- *   (keep ONEDRIVE_BASE_PATH = "SavePhotoBot" by default)
- *
- * Optional:
- *   IMAGE_VIEW_TOKEN
- *   DELETE_LOCAL_AFTER_UPLOAD (default "1")
+ * Improvements:
+ * - Retry + backoff on transient Graph errors (408/429/5xx)
+ * - Timeout (AbortController) to avoid hanging
+ * - Upload concurrency limiter (reduce 408)
+ * - Large upload conflictBehavior=replace (reduce duplicates on webhook retry)
+ * - If upload succeeded but "fetch item for webUrl" fails -> treat as success
  */
 
 require("dotenv").config();
@@ -80,6 +52,12 @@ const SP_DRIVE_ID = process.env.SP_DRIVE_ID || "";
 // Optional: delete local file after upload
 const DELETE_LOCAL_AFTER_UPLOAD = (process.env.DELETE_LOCAL_AFTER_UPLOAD || "1") === "1";
 
+// Reliability knobs
+const UPLOAD_CONCURRENCY = Math.max(1, Number(process.env.UPLOAD_CONCURRENCY || 2));
+const GRAPH_TIMEOUT_MS = Math.max(10_000, Number(process.env.GRAPH_TIMEOUT_MS || 90_000));
+const GRAPH_RETRY_MAX = Math.max(0, Number(process.env.GRAPH_RETRY_MAX || 4));
+const GRAPH_RETRY_BASE_MS = Math.max(200, Number(process.env.GRAPH_RETRY_BASE_MS || 600));
+
 /* -------------------- Validate env -------------------- */
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.error("❌ Missing env: LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
@@ -94,7 +72,6 @@ if (!MS_TENANT || !MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
   process.exit(1);
 }
 if (STORAGE_MODE === "sharepoint") {
-  // SP_DRIVE_ID is optional, but if not set we need hostname + site_path
   if (!SP_DRIVE_ID && (!SP_HOSTNAME || !SP_SITE_PATH)) {
     console.error("❌ Missing env for SharePoint: SP_HOSTNAME/SP_SITE_PATH (or set SP_DRIVE_ID)");
     process.exit(1);
@@ -114,7 +91,7 @@ if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true
 
 /* -------------------- Static route (Express 5 safe) -------------------- */
 app.get(/^\/images\/.*/, (req, res, next) => {
-  if (!IMAGE_VIEW_TOKEN) return next(); // open if token not set (dev)
+  if (!IMAGE_VIEW_TOKEN) return next();
   if (req.query.token !== IMAGE_VIEW_TOKEN) return res.sendStatus(403);
   return next();
 });
@@ -160,10 +137,6 @@ function sourceLabel(event) {
   if (s.type === "user") return `PRIVATE (${(s.userId || "").slice(-6)})`;
   return "UNKNOWN";
 }
-/**
- * Graph path must not encode "/" as %2F
- * So encode each segment only.
- */
 function encodeGraphPath(p) {
   return String(p || "")
     .split("/")
@@ -171,9 +144,48 @@ function encodeGraphPath(p) {
     .map(encodeURIComponent)
     .join("/");
 }
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function isTransientStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+/* -------------------- Simple concurrency limiter -------------------- */
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+
+  const next = () => {
+    if (active >= max) return;
+    const job = queue.shift();
+    if (!job) return;
+
+    active++;
+    Promise.resolve()
+      .then(job.fn)
+      .then(job.resolve, job.reject)
+      .finally(() => {
+        active--;
+        next();
+      });
+  };
+
+  return (fn) =>
+    new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject });
+      next();
+    });
+}
+const uploadLimiter = createLimiter(UPLOAD_CONCURRENCY);
+
+/* -------------------- Notify admin (DM) -------------------- */
+async function notifyAdmin(text) {
+  return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
+}
 
 /* -------------------- Cache: group name -------------------- */
-const nameCache = new Map(); // groupId -> { name, ts }
+const nameCache = new Map();
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 async function getGroupName(groupId) {
@@ -197,7 +209,7 @@ async function getSourceFolder(event) {
     try {
       const name = await getGroupName(s.groupId);
       return `group_${name}_${tail}`;
-    } catch (_) {
+    } catch {
       return `group_${tail}`;
     }
   }
@@ -217,31 +229,35 @@ function rememberMessageId(id) {
   setTimeout(() => seenMessageIds.delete(id), 10 * 60 * 1000).unref?.();
 }
 
-/* -------------------- Notify admin (DM) -------------------- */
-async function notifyAdmin(text) {
-  return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
-}
-
 /* -------------------- Microsoft Graph OAuth (ORG) -------------------- */
 let currentRefreshToken = MS_REFRESH_TOKEN;
 
 async function msPostForm(url, data) {
   const body = new URLSearchParams(data);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
 
-  const text = await res.text();
-  let json = {};
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), GRAPH_TIMEOUT_MS);
+
   try {
-    json = text ? JSON.parse(text) : {};
-  } catch {
-    json = { raw: text };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+      signal: controller.signal,
+    });
+
+    const text = await res.text();
+    let json = {};
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = { raw: text };
+    }
+    if (!res.ok) throw new Error(`MS OAuth error: ${JSON.stringify(json)}`);
+    return json;
+  } finally {
+    clearTimeout(t);
   }
-  if (!res.ok) throw new Error(`MS OAuth error: ${JSON.stringify(json)}`);
-  return json;
 }
 
 async function getGraphAccessToken() {
@@ -254,7 +270,6 @@ async function getGraphAccessToken() {
     scope: MS_SCOPES,
   });
 
-  // MS may rotate refresh token
   if (tok.refresh_token && tok.refresh_token !== currentRefreshToken) {
     currentRefreshToken = tok.refresh_token;
     console.warn("⚠️ Microsoft rotated refresh token. Update MS_REFRESH_TOKEN on Render ASAP.");
@@ -263,15 +278,32 @@ async function getGraphAccessToken() {
   return tok.access_token;
 }
 
-async function graphFetch(url, { accessToken, method = "GET", headers = {}, body } = {}) {
-  const res = await fetch(url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      ...headers,
+/* -------------------- fetch with timeout + retry -------------------- */
+async function fetchWithTimeout(url, options = {}, timeoutMs = GRAPH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function graphFetch(url, { accessToken, method = "GET", headers = {}, body, timeoutMs } = {}) {
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method,
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        ...headers,
+      },
+      body,
     },
-    body,
-  });
+    timeoutMs || GRAPH_TIMEOUT_MS
+  );
 
   const text = await res.text();
   let json = null;
@@ -280,43 +312,68 @@ async function graphFetch(url, { accessToken, method = "GET", headers = {}, body
   } catch {
     json = null;
   }
-
   return { res, text, json };
+}
+
+async function graphFetchRetry(url, opts, { max = GRAPH_RETRY_MAX } = {}) {
+  let attempt = 0;
+  let lastErr = null;
+
+  while (attempt <= max) {
+    try {
+      const out = await graphFetch(url, opts);
+      if (out.res.ok) return out;
+
+      if (isTransientStatus(out.res.status)) {
+        const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
+        console.warn(`⚠️ Graph transient ${out.res.status} retry in ${wait}ms: ${url}`);
+        await sleep(wait);
+        attempt++;
+        continue;
+      }
+
+      // non-transient
+      return out;
+    } catch (e) {
+      lastErr = e;
+      const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
+      console.warn(`⚠️ Graph exception retry in ${wait}ms: ${String(e?.message || e)}`);
+      await sleep(wait);
+      attempt++;
+    }
+  }
+
+  throw lastErr || new Error("Graph retry failed");
 }
 
 /* -------------------- Target Drive (SharePoint or OneDrive) -------------------- */
 let cachedDriveBase = null;
 let cachedDriveBaseTs = 0;
-const DRIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+const DRIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 async function getDriveBase(accessToken) {
-  // cache
   if (cachedDriveBase && Date.now() - cachedDriveBaseTs < DRIVE_CACHE_TTL_MS) return cachedDriveBase;
 
-  // OneDrive mode (My files)
   if (STORAGE_MODE === "onedrive") {
     cachedDriveBase = "https://graph.microsoft.com/v1.0/me/drive";
     cachedDriveBaseTs = Date.now();
     return cachedDriveBase;
   }
 
-  // SharePoint mode
   if (SP_DRIVE_ID) {
     cachedDriveBase = `https://graph.microsoft.com/v1.0/drives/${SP_DRIVE_ID}`;
     cachedDriveBaseTs = Date.now();
     return cachedDriveBase;
   }
 
-  // Discover siteId
   const siteUrl = `https://graph.microsoft.com/v1.0/sites/${SP_HOSTNAME}:${SP_SITE_PATH}`;
-  const site = await graphFetch(siteUrl, { accessToken });
+  const site = await graphFetchRetry(siteUrl, { accessToken });
   if (!site.res.ok) throw new Error(`Get site failed: ${site.text}`);
   const siteId = site.json?.id;
   if (!siteId) throw new Error("Get site: missing siteId");
 
-  // List drives (document libraries)
   const drivesUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`;
-  const drives = await graphFetch(drivesUrl, { accessToken });
+  const drives = await graphFetchRetry(drivesUrl, { accessToken });
   if (!drives.res.ok) throw new Error(`List drives failed: ${drives.text}`);
 
   const list = drives.json?.value || [];
@@ -327,8 +384,8 @@ async function getDriveBase(accessToken) {
   ].filter(Boolean);
 
   const found =
-    list.find(d => wantNames.includes(String(d.name || "").toLowerCase())) ||
-    list.find(d => String(d.name || "").toLowerCase() === "documents") ||
+    list.find((d) => wantNames.includes(String(d.name || "").toLowerCase())) ||
+    list.find((d) => String(d.name || "").toLowerCase() === "documents") ||
     list[0];
 
   if (!found?.id) throw new Error("No drive found in this site");
@@ -338,8 +395,7 @@ async function getDriveBase(accessToken) {
   return cachedDriveBase;
 }
 
-/* -------------------- Drive folder + upload (works for OneDrive & SharePoint) -------------------- */
-// Ensure folder exists by creating each segment
+/* -------------------- Drive folder + upload -------------------- */
 async function ensureDriveFolder(accessToken, driveBase, folderPath) {
   const parts = String(folderPath).split("/").filter(Boolean);
   let current = "";
@@ -347,33 +403,33 @@ async function ensureDriveFolder(accessToken, driveBase, folderPath) {
   for (const p of parts) {
     const next = current ? `${current}/${p}` : p;
 
-    // Check exists
     const checkUrl = `${driveBase}/root:/${encodeGraphPath(next)}`;
-    const check = await graphFetch(checkUrl, { accessToken });
-
+    const check = await graphFetchRetry(checkUrl, { accessToken });
     if (check.res.ok) {
       current = next;
       continue;
     }
 
-    // Create under parent
-    const parent = current; // "" or "a/b"
+    const parent = current;
     const createUrl = parent
       ? `${driveBase}/root:/${encodeGraphPath(parent)}:/children`
       : `${driveBase}/root/children`;
 
-    const create = await graphFetch(createUrl, {
-      accessToken,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: p,
-        folder: {},
-        "@microsoft.graph.conflictBehavior": "fail",
-      }),
-    });
+    const create = await graphFetchRetry(
+      createUrl,
+      {
+        accessToken,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: p,
+          folder: {},
+          "@microsoft.graph.conflictBehavior": "fail",
+        }),
+      },
+      { max: 2 }
+    );
 
-    // If already exists due to race, ignore
     if (!create.res.ok) {
       const msg = create.text || "";
       if (!msg.includes("nameAlreadyExists")) {
@@ -385,35 +441,35 @@ async function ensureDriveFolder(accessToken, driveBase, folderPath) {
   }
 }
 
-// Small upload (<=4MB): PUT content
 async function uploadSmall(accessToken, driveBase, drivePath, buffer, contentType) {
   const url = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/content`;
-  const { res, text, json } = await graphFetch(url, {
+
+  const out = await graphFetchRetry(url, {
     accessToken,
     method: "PUT",
     headers: { "Content-Type": contentType || "application/octet-stream" },
     body: buffer,
+    timeoutMs: Math.max(GRAPH_TIMEOUT_MS, 120_000),
   });
 
-  if (!res.ok) throw new Error(`Upload small failed: ${text}`);
-  return json || {};
+  if (!out.res.ok) throw new Error(`Upload small failed: ${out.text}`);
+  return out.json || {};
 }
 
-// Large upload (Create upload session + chunk)
 async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
   const createUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/createUploadSession`;
-  const created = await graphFetch(createUrl, {
+  const created = await graphFetchRetry(createUrl, {
     accessToken,
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename" } }),
+    // IMPORTANT: replace to avoid duplicates when webhook retry happens
+    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "replace" } }),
   });
 
   if (!created.res.ok) throw new Error(`CreateUploadSession failed: ${created.text}`);
   const uploadUrl = created.json?.uploadUrl;
   if (!uploadUrl) throw new Error("CreateUploadSession: missing uploadUrl");
 
-  // chunk size must be multiple of 320 KiB. Use 5 MiB.
   const chunkSize = 5 * 1024 * 1024;
   const total = buffer.length;
 
@@ -422,28 +478,58 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
     const end = Math.min(start + chunkSize, total);
     const chunk = buffer.slice(start, end);
 
-    const res = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Length": String(chunk.length),
-        "Content-Range": `bytes ${start}-${end - 1}/${total}`,
-      },
-      body: chunk,
-    });
+    // Retry chunk PUT on transient
+    let attempt = 0;
+    while (true) {
+      try {
+        const res = await fetchWithTimeout(
+          uploadUrl,
+          {
+            method: "PUT",
+            headers: {
+              "Content-Length": String(chunk.length),
+              "Content-Range": `bytes ${start}-${end - 1}/${total}`,
+            },
+            body: chunk,
+          },
+          Math.max(GRAPH_TIMEOUT_MS, 120_000)
+        );
 
-    if (!(res.status === 200 || res.status === 201 || res.status === 202)) {
-      const text = await res.text();
-      throw new Error(`Chunk upload failed (${start}-${end - 1}): ${text}`);
+        if (res.status === 200 || res.status === 201 || res.status === 202) break;
+
+        const txt = await res.text();
+        if (isTransientStatus(res.status) && attempt < GRAPH_RETRY_MAX) {
+          const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(`⚠️ Chunk transient ${res.status} retry in ${wait}ms (${start}-${end - 1})`);
+          await sleep(wait);
+          attempt++;
+          continue;
+        }
+
+        throw new Error(`Chunk upload failed (${start}-${end - 1}) status=${res.status}: ${txt}`);
+      } catch (e) {
+        if (attempt < GRAPH_RETRY_MAX) {
+          const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(`⚠️ Chunk exception retry in ${wait}ms (${start}-${end - 1}): ${String(e?.message || e)}`);
+          await sleep(wait);
+          attempt++;
+          continue;
+        }
+        throw e;
+      }
     }
 
     start = end;
   }
 
-  // Query final item by path to get webUrl
+  // Fetch final item by path (if this fails -> treat as success, return minimal)
   const itemUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}`;
-  const item = await graphFetch(itemUrl, { accessToken });
+  const item = await graphFetchRetry(itemUrl, { accessToken }, { max: 2 });
 
-  if (!item.res.ok) throw new Error(`Fetch uploaded item failed: ${item.text}`);
+  if (!item.res.ok) {
+    console.warn(`⚠️ Uploaded but cannot fetch item for webUrl (ok to ignore): ${item.text}`);
+    return { id: null, name: path.basename(drivePath), webUrl: null };
+  }
   return item.json || {};
 }
 
@@ -451,7 +537,6 @@ async function uploadToDrive({ folderName, fileName, localFilePath, contentType 
   const accessToken = await getGraphAccessToken();
   const driveBase = await getDriveBase(accessToken);
 
-  // Folder structure: ONEDRIVE_BASE_PATH/<folderName>
   const rootFolder = `${ONEDRIVE_BASE_PATH}/${folderName}`;
   await ensureDriveFolder(accessToken, driveBase, rootFolder);
 
@@ -474,22 +559,19 @@ async function uploadToDrive({ folderName, fileName, localFilePath, contentType 
   };
 }
 
-/* -------------------- Debug route (optional) -------------------- */
+/* -------------------- Debug route -------------------- */
 app.get("/debug/sharepoint", async (req, res) => {
   try {
     const accessToken = await getGraphAccessToken();
-
-    // show current target base & discovery info
     const driveBase = await getDriveBase(accessToken);
 
-    // If sharepoint discovery, also list drives for your site
     let drivesList = null;
     if (STORAGE_MODE === "sharepoint" && !SP_DRIVE_ID) {
       const siteUrl = `https://graph.microsoft.com/v1.0/sites/${SP_HOSTNAME}:${SP_SITE_PATH}`;
-      const site = await graphFetch(siteUrl, { accessToken });
+      const site = await graphFetchRetry(siteUrl, { accessToken });
       const siteId = site.json?.id;
       if (siteId) {
-        const drives = await graphFetch(`https://graph.microsoft.com/v1.0/sites/${siteId}/drives`, { accessToken });
+        const drives = await graphFetchRetry(`https://graph.microsoft.com/v1.0/sites/${siteId}/drives`, { accessToken });
         drivesList = drives.json?.value || null;
       }
     }
@@ -504,6 +586,10 @@ app.get("/debug/sharepoint", async (req, res) => {
       SP_DRIVE_ID: SP_DRIVE_ID ? "(set)" : "(not set)",
       driveBase,
       drivesList,
+      UPLOAD_CONCURRENCY,
+      GRAPH_TIMEOUT_MS,
+      GRAPH_RETRY_MAX,
+      GRAPH_RETRY_BASE_MS,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -523,17 +609,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   for (const event of events) {
     try {
       const srcType = event.source?.type;
-      console.log("➡️ Event:", {
-        type: event.type,
-        srcType,
-        msgType: event.message?.type,
-        messageId: event.message?.id,
-      });
 
-      // ---- Silent policy ----
+      // Silent policy
       if (event.type === "join") continue;
 
-      // follow happens in private (user add friend)
+      // follow happens in private
       if (event.type === "follow") {
         if (srcType === "user" && event.replyToken) {
           await client.replyMessage(event.replyToken, [
@@ -558,14 +638,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const folderName = await getSourceFolder(event);
       const day = dateFolder();
 
-      // local dir: /images/<folderName>/<YYYY-MM-DD>/
       const targetDir = path.join(baseImagesDir, folderName, day);
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
-      // get content stream
       const stream = await client.getMessageContent(messageId);
 
-      // best-effort ext from content-type
       const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
       const ext =
         ct.includes("png") ? "png" :
@@ -580,7 +657,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       await saveStreamToFile(stream, filePath);
       console.log("✅ Saved local:", filePath);
 
-      // local view url (optional)
       const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(fileName)}`;
       const localViewUrl = IMAGE_VIEW_TOKEN
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
@@ -591,17 +667,18 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ext === "webp" ? "image/webp" :
         "image/jpeg";
 
-      // Target path: ONEDRIVE_BASE_PATH/<folderName>/<YYYY-MM-DD>/<fileName>
-      const up = await uploadToDrive({
-        folderName: `${folderName}/${day}`,
-        fileName,
-        localFilePath: filePath,
-        contentType,
-      });
+      // LIMIT concurrent uploads
+      const up = await uploadLimiter(() =>
+        uploadToDrive({
+          folderName: `${folderName}/${day}`,
+          fileName,
+          localFilePath: filePath,
+          contentType,
+        })
+      );
 
       console.log(`☁️ Uploaded (${up.storage}):`, up.drivePath, up.webUrl || "(no webUrl)");
 
-      // Notify admin always when image from group/room
       if (srcType === "group" || srcType === "room") {
         const msg =
           `📸 มีรูปถูกส่งเข้ามา\n` +
@@ -610,14 +687,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           `โฟลเดอร์: ${folderName}\n` +
           `วันที่: ${day}\n` +
           `ไฟล์: ${fileName}\n` +
-          `Link: ${up.webUrl || "(สร้างลิงก์ไม่ได้)"}\n` +
+          `Link: ${up.webUrl || "(ลิงก์อาจยังไม่พร้อม แต่ไฟล์อัปโหลดแล้ว)"}\n` +
           `Local: ${localViewUrl}`;
 
         await notifyAdmin(msg);
-
-        // IMPORTANT: Silent in group/room -> no reply, no push to group/room
+        // Silent in group/room
       } else {
-        // Private chat (optional)
         if (srcType === "user" && event.replyToken) {
           await client.replyMessage(event.replyToken, [
             { type: "text", text: `✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)` },
@@ -625,17 +700,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         }
       }
 
-      // delete local file (optional)
       if (DELETE_LOCAL_AFTER_UPLOAD) {
         try {
           fs.unlinkSync(filePath);
 
-          // remove empty day folder
           try {
             if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0) fs.rmdirSync(targetDir);
           } catch {}
 
-          // remove empty parent folder (/images/<folderName>)
           const parentDir = path.join(baseImagesDir, folderName);
           try {
             if (fs.existsSync(parentDir) && fs.readdirSync(parentDir).length === 0) fs.rmdirSync(parentDir);
@@ -644,11 +716,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
     } catch (err) {
       console.error("❌ Error:", err?.message || err);
-
-      // Best-effort admin notify
       try {
         await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err).slice(0, 900)}`);
-      } catch (_) {}
+      } catch {}
     }
   }
 });
