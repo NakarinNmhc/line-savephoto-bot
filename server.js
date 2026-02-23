@@ -1,23 +1,35 @@
 /**
- * SavePhotoBot - server.js (Render-ready + OneDrive ORG + Date folders + Logs)
- * Requirements:
+ * SavePhotoBot - server.js (Render-ready + SharePoint/OneDrive + Date folders + Logs)
+ *
+ * Goals:
  * - Silent in group/room (NO replyMessage, NO pushMessage to group/room)
  * - Save images locally into /images/<source-folder>/<YYYY-MM-DD> (optional debug)
- * - Upload images to OneDrive (Microsoft Graph) using ORG tenant refresh token
- * - Notify ADMIN_USER_ID (DM) always when image arrives from group/room (with OneDrive link)
- * - Optional static route /images for viewing with IMAGE_VIEW_TOKEN
+ * - Upload images to SharePoint (Site Documents) OR OneDrive via Microsoft Graph (ORG tenant refresh token)
+ * - Notify ADMIN_USER_ID (DM) always when image arrives from group/room (with link)
  *
  * ENV required:
  *   LINE_ACCESS_TOKEN
  *   LINE_CHANNEL_SECRET
  *   ADMIN_USER_ID
  *
- * OneDrive ORG:
- *   MS_TENANT                 (Directory/Tenant ID)
- *   MS_CLIENT_ID              (Application/Client ID)
- *   MS_REFRESH_TOKEN          (Refresh token from device code flow AFTER admin consent)
- *   MS_SCOPES                 (recommended: "offline_access User.Read Files.ReadWrite.All")
- *   ONEDRIVE_BASE_PATH        (default: "SavePhotoBot")
+ * Microsoft Graph (ORG delegated):
+ *   MS_TENANT
+ *   MS_CLIENT_ID
+ *   MS_REFRESH_TOKEN
+ *   MS_SCOPES (recommended: "offline_access User.Read Files.ReadWrite.All Sites.ReadWrite.All")
+ *
+ * Storage mode:
+ *   STORAGE_MODE=sharepoint | onedrive   (default: sharepoint)
+ *
+ * SharePoint target (for sharepoint mode):
+ *   SP_HOSTNAME=milestonesth.sharepoint.com
+ *   SP_SITE_PATH=/sites/SavePhotoBot
+ *   SP_DRIVE_NAME=Shared Documents   (optional; try "Documents" too)
+ *   SP_DRIVE_ID=xxxxx (optional; if set, skip discovery and use directly - most stable)
+ *
+ * Folder structure inside target drive:
+ *   ONEDRIVE_BASE_PATH/<source>/<YYYY-MM-DD>/<file>
+ *   (keep ONEDRIVE_BASE_PATH = "SavePhotoBot" by default)
  *
  * Optional:
  *   IMAGE_VIEW_TOKEN
@@ -45,14 +57,25 @@ const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
 // Optional: protect image viewing route
 const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
 
-// OneDrive (Microsoft Graph) - ORG tenant
-const MS_TENANT = process.env.MS_TENANT; // Directory (tenant) ID
-const MS_CLIENT_ID = process.env.MS_CLIENT_ID; // Application (client) ID
-const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN; // refresh token (org user)
+// Microsoft Graph
+const MS_TENANT = process.env.MS_TENANT;
+const MS_CLIENT_ID = process.env.MS_CLIENT_ID;
+const MS_REFRESH_TOKEN = process.env.MS_REFRESH_TOKEN;
 const MS_SCOPES =
-  process.env.MS_SCOPES || "offline_access User.Read Files.ReadWrite.All";
+  process.env.MS_SCOPES ||
+  "offline_access User.Read Files.ReadWrite.All Sites.ReadWrite.All";
 
+// Storage selection
+const STORAGE_MODE = (process.env.STORAGE_MODE || "sharepoint").toLowerCase(); // sharepoint | onedrive
+
+// Base folder name inside target drive
 const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBot";
+
+// SharePoint target
+const SP_HOSTNAME = process.env.SP_HOSTNAME || "";
+const SP_SITE_PATH = process.env.SP_SITE_PATH || ""; // e.g. /sites/SavePhotoBot
+const SP_DRIVE_NAME = process.env.SP_DRIVE_NAME || "Shared Documents";
+const SP_DRIVE_ID = process.env.SP_DRIVE_ID || "";
 
 // Optional: delete local file after upload
 const DELETE_LOCAL_AFTER_UPLOAD = (process.env.DELETE_LOCAL_AFTER_UPLOAD || "1") === "1";
@@ -69,6 +92,13 @@ if (!ADMIN_USER_ID) {
 if (!MS_TENANT || !MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
   console.error("❌ Missing env: MS_TENANT or MS_CLIENT_ID or MS_REFRESH_TOKEN");
   process.exit(1);
+}
+if (STORAGE_MODE === "sharepoint") {
+  // SP_DRIVE_ID is optional, but if not set we need hostname + site_path
+  if (!SP_DRIVE_ID && (!SP_HOSTNAME || !SP_SITE_PATH)) {
+    console.error("❌ Missing env for SharePoint: SP_HOSTNAME/SP_SITE_PATH (or set SP_DRIVE_ID)");
+    process.exit(1);
+  }
 }
 
 /* -------------------- LINE client -------------------- */
@@ -94,19 +124,14 @@ app.use("/images", express.static(baseImagesDir));
 function pad(n) {
   return String(n).padStart(2, "0");
 }
-
-// Date folder: YYYY-MM-DD (server timezone)
 function dateFolder() {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
-
-// Filename: date + messageId
 function makeFileName(messageId, ext = "jpg") {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${messageId}.${ext}`;
 }
-
 function sanitizeFolderName(name) {
   return String(name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -114,7 +139,6 @@ function sanitizeFolderName(name) {
     .trim()
     .slice(0, 80);
 }
-
 function saveStreamToFile(stream, filePath) {
   return new Promise((resolve, reject) => {
     const w = fs.createWriteStream(filePath);
@@ -124,13 +148,11 @@ function saveStreamToFile(stream, filePath) {
     stream.on("error", reject);
   });
 }
-
 function buildPublicBaseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}`;
 }
-
 function sourceLabel(event) {
   const s = event.source || {};
   if (s.type === "group") return `GROUP (${(s.groupId || "").slice(-6)})`;
@@ -138,7 +160,6 @@ function sourceLabel(event) {
   if (s.type === "user") return `PRIVATE (${(s.userId || "").slice(-6)})`;
   return "UNKNOWN";
 }
-
 /**
  * Graph path must not encode "/" as %2F
  * So encode each segment only.
@@ -201,7 +222,7 @@ async function notifyAdmin(text) {
   return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
 }
 
-/* -------------------- OneDrive / Microsoft Graph (ORG) -------------------- */
+/* -------------------- Microsoft Graph OAuth (ORG) -------------------- */
 let currentRefreshToken = MS_REFRESH_TOKEN;
 
 async function msPostForm(url, data) {
@@ -230,7 +251,7 @@ async function getGraphAccessToken() {
     client_id: MS_CLIENT_ID,
     grant_type: "refresh_token",
     refresh_token: currentRefreshToken,
-    scope: MS_SCOPES, // ✅ must match the scopes used to obtain refresh token
+    scope: MS_SCOPES,
   });
 
   // MS may rotate refresh token
@@ -263,8 +284,63 @@ async function graphFetch(url, { accessToken, method = "GET", headers = {}, body
   return { res, text, json };
 }
 
+/* -------------------- Target Drive (SharePoint or OneDrive) -------------------- */
+let cachedDriveBase = null;
+let cachedDriveBaseTs = 0;
+const DRIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+async function getDriveBase(accessToken) {
+  // cache
+  if (cachedDriveBase && Date.now() - cachedDriveBaseTs < DRIVE_CACHE_TTL_MS) return cachedDriveBase;
+
+  // OneDrive mode (My files)
+  if (STORAGE_MODE === "onedrive") {
+    cachedDriveBase = "https://graph.microsoft.com/v1.0/me/drive";
+    cachedDriveBaseTs = Date.now();
+    return cachedDriveBase;
+  }
+
+  // SharePoint mode
+  if (SP_DRIVE_ID) {
+    cachedDriveBase = `https://graph.microsoft.com/v1.0/drives/${SP_DRIVE_ID}`;
+    cachedDriveBaseTs = Date.now();
+    return cachedDriveBase;
+  }
+
+  // Discover siteId
+  const siteUrl = `https://graph.microsoft.com/v1.0/sites/${SP_HOSTNAME}:${SP_SITE_PATH}`;
+  const site = await graphFetch(siteUrl, { accessToken });
+  if (!site.res.ok) throw new Error(`Get site failed: ${site.text}`);
+  const siteId = site.json?.id;
+  if (!siteId) throw new Error("Get site: missing siteId");
+
+  // List drives (document libraries)
+  const drivesUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`;
+  const drives = await graphFetch(drivesUrl, { accessToken });
+  if (!drives.res.ok) throw new Error(`List drives failed: ${drives.text}`);
+
+  const list = drives.json?.value || [];
+  const wantNames = [
+    (SP_DRIVE_NAME || "").toLowerCase(),
+    "shared documents",
+    "documents",
+  ].filter(Boolean);
+
+  const found =
+    list.find(d => wantNames.includes(String(d.name || "").toLowerCase())) ||
+    list.find(d => String(d.name || "").toLowerCase() === "documents") ||
+    list[0];
+
+  if (!found?.id) throw new Error("No drive found in this site");
+
+  cachedDriveBase = `https://graph.microsoft.com/v1.0/drives/${found.id}`;
+  cachedDriveBaseTs = Date.now();
+  return cachedDriveBase;
+}
+
+/* -------------------- Drive folder + upload (works for OneDrive & SharePoint) -------------------- */
 // Ensure folder exists by creating each segment
-async function ensureOneDriveFolder(accessToken, folderPath) {
+async function ensureDriveFolder(accessToken, driveBase, folderPath) {
   const parts = String(folderPath).split("/").filter(Boolean);
   let current = "";
 
@@ -272,7 +348,7 @@ async function ensureOneDriveFolder(accessToken, folderPath) {
     const next = current ? `${current}/${p}` : p;
 
     // Check exists
-    const checkUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(next)}`;
+    const checkUrl = `${driveBase}/root:/${encodeGraphPath(next)}`;
     const check = await graphFetch(checkUrl, { accessToken });
 
     if (check.res.ok) {
@@ -283,8 +359,8 @@ async function ensureOneDriveFolder(accessToken, folderPath) {
     // Create under parent
     const parent = current; // "" or "a/b"
     const createUrl = parent
-      ? `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(parent)}:/children`
-      : `https://graph.microsoft.com/v1.0/me/drive/root/children`;
+      ? `${driveBase}/root:/${encodeGraphPath(parent)}:/children`
+      : `${driveBase}/root/children`;
 
     const create = await graphFetch(createUrl, {
       accessToken,
@@ -310,8 +386,8 @@ async function ensureOneDriveFolder(accessToken, folderPath) {
 }
 
 // Small upload (<=4MB): PUT content
-async function uploadSmall(accessToken, oneDrivePath, buffer, contentType) {
-  const url = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}:/content`;
+async function uploadSmall(accessToken, driveBase, drivePath, buffer, contentType) {
+  const url = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/content`;
   const { res, text, json } = await graphFetch(url, {
     accessToken,
     method: "PUT",
@@ -324,8 +400,8 @@ async function uploadSmall(accessToken, oneDrivePath, buffer, contentType) {
 }
 
 // Large upload (Create upload session + chunk)
-async function uploadLarge(accessToken, oneDrivePath, buffer) {
-  const createUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}:/createUploadSession`;
+async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
+  const createUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/createUploadSession`;
   const created = await graphFetch(createUrl, {
     accessToken,
     method: "POST",
@@ -355,7 +431,6 @@ async function uploadLarge(accessToken, oneDrivePath, buffer) {
       body: chunk,
     });
 
-    // 202/201 ok; 200 ok
     if (!(res.status === 200 || res.status === 201 || res.status === 202)) {
       const text = await res.text();
       throw new Error(`Chunk upload failed (${start}-${end - 1}): ${text}`);
@@ -365,37 +440,75 @@ async function uploadLarge(accessToken, oneDrivePath, buffer) {
   }
 
   // Query final item by path to get webUrl
-  const itemUrl = `https://graph.microsoft.com/v1.0/me/drive/root:/${encodeGraphPath(oneDrivePath)}`;
+  const itemUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}`;
   const item = await graphFetch(itemUrl, { accessToken });
 
   if (!item.res.ok) throw new Error(`Fetch uploaded item failed: ${item.text}`);
   return item.json || {};
 }
 
-async function uploadToOneDrive({ folderName, fileName, localFilePath, contentType }) {
+async function uploadToDrive({ folderName, fileName, localFilePath, contentType }) {
   const accessToken = await getGraphAccessToken();
+  const driveBase = await getDriveBase(accessToken);
 
-  // folderName can include subpaths (e.g. "group_xxx/2026-02-23")
-  const oneDriveFolder = `${ONEDRIVE_BASE_PATH}/${folderName}`;
-  await ensureOneDriveFolder(accessToken, oneDriveFolder);
+  // Folder structure: ONEDRIVE_BASE_PATH/<folderName>
+  const rootFolder = `${ONEDRIVE_BASE_PATH}/${folderName}`;
+  await ensureDriveFolder(accessToken, driveBase, rootFolder);
 
-  const oneDrivePath = `${oneDriveFolder}/${fileName}`;
+  const drivePath = `${rootFolder}/${fileName}`;
   const buf = fs.readFileSync(localFilePath);
 
   const FOUR_MB = 4 * 1024 * 1024;
   const item =
     buf.length <= FOUR_MB
-      ? await uploadSmall(accessToken, oneDrivePath, buf, contentType)
-      : await uploadLarge(accessToken, oneDrivePath, buf);
+      ? await uploadSmall(accessToken, driveBase, drivePath, buf, contentType)
+      : await uploadLarge(accessToken, driveBase, drivePath, buf);
 
   return {
     webUrl: item.webUrl || null,
     id: item.id || null,
     name: item.name || fileName,
     size: item.size || buf.length,
-    oneDrivePath,
+    drivePath,
+    storage: STORAGE_MODE,
   };
 }
+
+/* -------------------- Debug route (optional) -------------------- */
+app.get("/debug/sharepoint", async (req, res) => {
+  try {
+    const accessToken = await getGraphAccessToken();
+
+    // show current target base & discovery info
+    const driveBase = await getDriveBase(accessToken);
+
+    // If sharepoint discovery, also list drives for your site
+    let drivesList = null;
+    if (STORAGE_MODE === "sharepoint" && !SP_DRIVE_ID) {
+      const siteUrl = `https://graph.microsoft.com/v1.0/sites/${SP_HOSTNAME}:${SP_SITE_PATH}`;
+      const site = await graphFetch(siteUrl, { accessToken });
+      const siteId = site.json?.id;
+      if (siteId) {
+        const drives = await graphFetch(`https://graph.microsoft.com/v1.0/sites/${siteId}/drives`, { accessToken });
+        drivesList = drives.json?.value || null;
+      }
+    }
+
+    res.json({
+      ok: true,
+      STORAGE_MODE,
+      ONEDRIVE_BASE_PATH,
+      SP_HOSTNAME,
+      SP_SITE_PATH,
+      SP_DRIVE_NAME,
+      SP_DRIVE_ID: SP_DRIVE_ID ? "(set)" : "(not set)",
+      driveBase,
+      drivesList,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
 /* -------------------- Webhook -------------------- */
 app.post("/webhook", line.middleware(config), async (req, res) => {
@@ -473,21 +586,20 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
         : `${baseUrl}${viewPath}`;
 
-      // ---- Upload to OneDrive ----
       const contentType =
         ext === "png" ? "image/png" :
         ext === "webp" ? "image/webp" :
         "image/jpeg";
 
-      // OneDrive path: SavePhotoBot/<folderName>/<YYYY-MM-DD>/<fileName>
-      const up = await uploadToOneDrive({
+      // Target path: ONEDRIVE_BASE_PATH/<folderName>/<YYYY-MM-DD>/<fileName>
+      const up = await uploadToDrive({
         folderName: `${folderName}/${day}`,
         fileName,
         localFilePath: filePath,
         contentType,
       });
 
-      console.log("☁️ Uploaded OneDrive:", up.oneDrivePath, up.webUrl || "(no webUrl)");
+      console.log(`☁️ Uploaded (${up.storage}):`, up.drivePath, up.webUrl || "(no webUrl)");
 
       // Notify admin always when image from group/room
       if (srcType === "group" || srcType === "room") {
@@ -498,7 +610,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           `โฟลเดอร์: ${folderName}\n` +
           `วันที่: ${day}\n` +
           `ไฟล์: ${fileName}\n` +
-          `OneDrive: ${up.webUrl || "(สร้างลิงก์ไม่ได้)"}\n` +
+          `Link: ${up.webUrl || "(สร้างลิงก์ไม่ได้)"}\n` +
           `Local: ${localViewUrl}`;
 
         await notifyAdmin(msg);
@@ -508,7 +620,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         // Private chat (optional)
         if (srcType === "user" && event.replyToken) {
           await client.replyMessage(event.replyToken, [
-            { type: "text", text: "✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น OneDrive แล้ว)" },
+            { type: "text", text: `✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)` },
           ]);
         }
       }
@@ -532,7 +644,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
     } catch (err) {
       console.error("❌ Error:", err?.message || err);
-      console.error("LINE API error body:", err?.originalError?.response?.data);
 
       // Best-effort admin notify
       try {
