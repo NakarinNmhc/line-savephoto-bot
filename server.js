@@ -715,11 +715,19 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         } catch {}
       }
     } catch (err) {
-      console.error("❌ Error:", err?.message || err);
-      try {
-        await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err).slice(0, 900)}`);
-      } catch {}
-    }
+  console.error("❌ Error:", err?.message || err);
+
+  const r = err?.originalError?.response || err?.response;
+  if (r) {
+    console.error("➡️ status:", r.status);
+    console.error("➡️ data:", r.data);
+  }
+
+  // แจ้ง admin (best-effort)
+  try {
+    await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err).slice(0, 900)}`);
+  } catch (_) {}
+}
   }
 });
 
