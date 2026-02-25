@@ -1,11 +1,13 @@
 /**
- * SavePhotoBot - server.js (Render-ready + SharePoint/OneDrive + Date folders + Logs)
- * Improvements:
- * - Retry + backoff on transient Graph errors (408/429/5xx)
- * - Timeout (AbortController) to avoid hanging
- * - Upload concurrency limiter (reduce 408)
- * - Large upload conflictBehavior=replace (reduce duplicates on webhook retry)
- * - If upload succeeded but "fetch item for webUrl" fails -> treat as success
+ * SavePhotoBot - server.js (Production-ready)
+ * Goals:
+ * ✅ Production logging template (requestId, event summary, timing, structured error)
+ * ✅ Stable webhook (no dropped events, per-event isolation, dedupe, safe reply/push)
+ * ✅ Render sleep mitigation (keepalive ping + external ping suggestion)
+ *
+ * Notes:
+ * - LINE middleware requires raw body verification; we keep `line.middleware(config)` as-is.
+ * - We reply HTTP 200 ASAP to avoid LINE retry storms.
  */
 
 require("dotenv").config();
@@ -14,17 +16,14 @@ const express = require("express");
 const line = require("@line/bot-sdk");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
-
-/* -------------------- Basic health routes -------------------- */
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.status(200).send("OK"));
 
 /* -------------------- ENV -------------------- */
 const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID;
+const ADMIN_USER_ID = process.env.ADMIN_USER_ID; // can be Uxxx or Cxxx or Rxxx
 
 // Optional: protect image viewing route
 const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
@@ -39,41 +38,69 @@ const MS_SCOPES =
 
 // Storage selection
 const STORAGE_MODE = (process.env.STORAGE_MODE || "sharepoint").toLowerCase(); // sharepoint | onedrive
-
-// Base folder name inside target drive
 const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBot";
 
 // SharePoint target
 const SP_HOSTNAME = process.env.SP_HOSTNAME || "";
 const SP_SITE_PATH = process.env.SP_SITE_PATH || ""; // e.g. /sites/SavePhotoBot
-const SP_DRIVE_NAME = process.env.SP_DRIVE_NAME || "Shared Documents";
+const SP_DRIVE_NAME = process.env.SP_DRIVE_NAME || "Documents";
 const SP_DRIVE_ID = process.env.SP_DRIVE_ID || "";
 
 // Optional: delete local file after upload
-const DELETE_LOCAL_AFTER_UPLOAD = (process.env.DELETE_LOCAL_AFTER_UPLOAD || "1") === "1";
+const DELETE_LOCAL_AFTER_UPLOAD =
+  (process.env.DELETE_LOCAL_AFTER_UPLOAD || "1") === "1";
 
 // Reliability knobs
-const UPLOAD_CONCURRENCY = Math.max(1, Number(process.env.UPLOAD_CONCURRENCY || 2));
-const GRAPH_TIMEOUT_MS = Math.max(10_000, Number(process.env.GRAPH_TIMEOUT_MS || 90_000));
+const UPLOAD_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.UPLOAD_CONCURRENCY || 2)
+);
+const GRAPH_TIMEOUT_MS = Math.max(
+  10_000,
+  Number(process.env.GRAPH_TIMEOUT_MS || 90_000)
+);
 const GRAPH_RETRY_MAX = Math.max(0, Number(process.env.GRAPH_RETRY_MAX || 4));
-const GRAPH_RETRY_BASE_MS = Math.max(200, Number(process.env.GRAPH_RETRY_BASE_MS || 600));
+const GRAPH_RETRY_BASE_MS = Math.max(
+  200,
+  Number(process.env.GRAPH_RETRY_BASE_MS || 600)
+);
+
+// Keep-alive for Render
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim(); // e.g. https://xxx.onrender.com
+const KEEPALIVE_ENABLED = (process.env.KEEPALIVE_ENABLED || "1") === "1";
+const KEEPALIVE_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.KEEPALIVE_INTERVAL_MS || 300_000)
+);
 
 /* -------------------- Validate env -------------------- */
+function looksLikeLineId(id) {
+  // LINE IDs typically start with U (user), C (group), R (room)
+  return typeof id === "string" && /^[UCR]/.test(id) && id.length >= 10;
+}
+
 if (!LINE_ACCESS_TOKEN || !LINE_CHANNEL_SECRET) {
   console.error("❌ Missing env: LINE_ACCESS_TOKEN or LINE_CHANNEL_SECRET");
   process.exit(1);
 }
-if (!ADMIN_USER_ID) {
-  console.error("❌ Missing env: ADMIN_USER_ID");
+
+if (!ADMIN_USER_ID || !looksLikeLineId(ADMIN_USER_ID)) {
+  console.error(
+    "❌ Missing/Invalid env: ADMIN_USER_ID (ต้องเป็น userId(U...) หรือ groupId(C...) หรือ roomId(R...))"
+  );
   process.exit(1);
 }
+
 if (!MS_TENANT || !MS_CLIENT_ID || !MS_REFRESH_TOKEN) {
   console.error("❌ Missing env: MS_TENANT or MS_CLIENT_ID or MS_REFRESH_TOKEN");
   process.exit(1);
 }
+
 if (STORAGE_MODE === "sharepoint") {
   if (!SP_DRIVE_ID && (!SP_HOSTNAME || !SP_SITE_PATH)) {
-    console.error("❌ Missing env for SharePoint: SP_HOSTNAME/SP_SITE_PATH (or set SP_DRIVE_ID)");
+    console.error(
+      "❌ Missing env for SharePoint: SP_HOSTNAME/SP_SITE_PATH (or set SP_DRIVE_ID)"
+    );
     process.exit(1);
   }
 }
@@ -84,6 +111,10 @@ const config = {
   channelSecret: LINE_CHANNEL_SECRET,
 };
 const client = new line.Client(config);
+
+/* -------------------- Basic health routes -------------------- */
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.status(200).send("OK"));
 
 /* -------------------- Storage (local temp) -------------------- */
 const baseImagesDir = path.join(__dirname, "images");
@@ -97,6 +128,35 @@ app.get(/^\/images\/.*/, (req, res, next) => {
 });
 app.use("/images", express.static(baseImagesDir));
 
+/* -------------------- Production Logger -------------------- */
+function nowISO() {
+  return new Date().toISOString();
+}
+function rid() {
+  return crypto.randomBytes(6).toString("hex"); // short request id
+}
+function safeJson(v) {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+function log(level, msg, meta = {}) {
+  // level: INFO | WARN | ERROR | DEBUG
+  const line = {
+    ts: nowISO(),
+    level,
+    msg,
+    ...meta,
+  };
+  // keep log single-line JSON for Render readability
+  console.log(safeJson(line));
+}
+function msSince(t0) {
+  return Date.now() - t0;
+}
+
 /* -------------------- Helpers -------------------- */
 function pad(n) {
   return String(n).padStart(2, "0");
@@ -107,7 +167,9 @@ function dateFolder() {
 }
 function makeFileName(messageId, ext = "jpg") {
   const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${messageId}.${ext}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
+    d.getDate()
+  )}_${messageId}.${ext}`;
 }
 function sanitizeFolderName(name) {
   return String(name || "")
@@ -126,6 +188,10 @@ function saveStreamToFile(stream, filePath) {
   });
 }
 function buildPublicBaseUrl(req) {
+  // Prefer explicit PUBLIC_BASE_URL (best for Render)
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+
+  // fallback from headers
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}`;
@@ -149,6 +215,19 @@ function sleep(ms) {
 }
 function isTransientStatus(status) {
   return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+function extFromContentType(ct) {
+  const c = String(ct || "").toLowerCase();
+  if (c.includes("png")) return "png";
+  if (c.includes("webp")) return "webp";
+  if (c.includes("jpeg")) return "jpg";
+  if (c.includes("jpg")) return "jpg";
+  return "jpg";
+}
+function mimeFromExt(ext) {
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  return "image/jpeg";
 }
 
 /* -------------------- Simple concurrency limiter -------------------- */
@@ -179,9 +258,23 @@ function createLimiter(max) {
 }
 const uploadLimiter = createLimiter(UPLOAD_CONCURRENCY);
 
-/* -------------------- Notify admin (DM) -------------------- */
-async function notifyAdmin(text) {
-  return client.pushMessage(ADMIN_USER_ID, [{ type: "text", text }]);
+/* -------------------- Notify admin (push) with safety -------------------- */
+async function notifyAdmin(text, meta = {}) {
+  // Avoid LINE max message length issues
+  const msg = String(text || "").slice(0, 4900);
+
+  try {
+    await client.pushMessage(ADMIN_USER_ID, [{ type: "text", text: msg }]);
+    log("INFO", "ADMIN_NOTIFY_OK", meta);
+  } catch (e) {
+    // This is where you used to get: "The property, 'to', is invalid"
+    log("ERROR", "ADMIN_NOTIFY_FAIL", {
+      ...meta,
+      err: String(e?.message || e),
+      hint:
+        "ถ้าเจอ to invalid ให้เช็คว่า ADMIN_USER_ID เป็น U.../C.../R... ถูกต้อง และไม่มีช่องว่าง",
+    });
+  }
 }
 
 /* -------------------- Cache: group name -------------------- */
@@ -229,7 +322,7 @@ function rememberMessageId(id) {
   setTimeout(() => seenMessageIds.delete(id), 10 * 60 * 1000).unref?.();
 }
 
-/* -------------------- Microsoft Graph OAuth (ORG) -------------------- */
+/* -------------------- Microsoft Graph OAuth -------------------- */
 let currentRefreshToken = MS_REFRESH_TOKEN;
 
 async function msPostForm(url, data) {
@@ -253,7 +346,7 @@ async function msPostForm(url, data) {
     } catch {
       json = { raw: text };
     }
-    if (!res.ok) throw new Error(`MS OAuth error: ${JSON.stringify(json)}`);
+    if (!res.ok) throw new Error(`MS OAuth error: ${safeJson(json)}`);
     return json;
   } finally {
     clearTimeout(t);
@@ -272,7 +365,9 @@ async function getGraphAccessToken() {
 
   if (tok.refresh_token && tok.refresh_token !== currentRefreshToken) {
     currentRefreshToken = tok.refresh_token;
-    console.warn("⚠️ Microsoft rotated refresh token. Update MS_REFRESH_TOKEN on Render ASAP.");
+    log("WARN", "MS_REFRESH_TOKEN_ROTATED", {
+      hint: "Update MS_REFRESH_TOKEN on Render ASAP (token มีการหมุน)",
+    });
   }
 
   return tok.access_token;
@@ -296,10 +391,7 @@ async function graphFetch(url, { accessToken, method = "GET", headers = {}, body
     url,
     {
       method,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        ...headers,
-      },
+      headers: { Authorization: `Bearer ${accessToken}`, ...headers },
       body,
     },
     timeoutMs || GRAPH_TIMEOUT_MS
@@ -326,18 +418,26 @@ async function graphFetchRetry(url, opts, { max = GRAPH_RETRY_MAX } = {}) {
 
       if (isTransientStatus(out.res.status)) {
         const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
-        console.warn(`⚠️ Graph transient ${out.res.status} retry in ${wait}ms: ${url}`);
+        log("WARN", "GRAPH_TRANSIENT_RETRY", {
+          status: out.res.status,
+          waitMs: wait,
+          url,
+          attempt,
+        });
         await sleep(wait);
         attempt++;
         continue;
       }
 
-      // non-transient
-      return out;
+      return out; // non-transient
     } catch (e) {
       lastErr = e;
       const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
-      console.warn(`⚠️ Graph exception retry in ${wait}ms: ${String(e?.message || e)}`);
+      log("WARN", "GRAPH_EXCEPTION_RETRY", {
+        waitMs: wait,
+        attempt,
+        err: String(e?.message || e),
+      });
       await sleep(wait);
       attempt++;
     }
@@ -352,7 +452,9 @@ let cachedDriveBaseTs = 0;
 const DRIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 async function getDriveBase(accessToken) {
-  if (cachedDriveBase && Date.now() - cachedDriveBaseTs < DRIVE_CACHE_TTL_MS) return cachedDriveBase;
+  if (cachedDriveBase && Date.now() - cachedDriveBaseTs < DRIVE_CACHE_TTL_MS) {
+    return cachedDriveBase;
+  }
 
   if (STORAGE_MODE === "onedrive") {
     cachedDriveBase = "https://graph.microsoft.com/v1.0/me/drive";
@@ -462,7 +564,6 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
     accessToken,
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // IMPORTANT: replace to avoid duplicates when webhook retry happens
     body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "replace" } }),
   });
 
@@ -478,7 +579,6 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
     const end = Math.min(start + chunkSize, total);
     const chunk = buffer.slice(start, end);
 
-    // Retry chunk PUT on transient
     let attempt = 0;
     while (true) {
       try {
@@ -500,7 +600,11 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
         const txt = await res.text();
         if (isTransientStatus(res.status) && attempt < GRAPH_RETRY_MAX) {
           const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
-          console.warn(`⚠️ Chunk transient ${res.status} retry in ${wait}ms (${start}-${end - 1})`);
+          log("WARN", "GRAPH_CHUNK_RETRY", {
+            status: res.status,
+            waitMs: wait,
+            range: `${start}-${end - 1}/${total}`,
+          });
           await sleep(wait);
           attempt++;
           continue;
@@ -510,7 +614,11 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
       } catch (e) {
         if (attempt < GRAPH_RETRY_MAX) {
           const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
-          console.warn(`⚠️ Chunk exception retry in ${wait}ms (${start}-${end - 1}): ${String(e?.message || e)}`);
+          log("WARN", "GRAPH_CHUNK_EXCEPTION_RETRY", {
+            waitMs: wait,
+            range: `${start}-${end - 1}/${total}`,
+            err: String(e?.message || e),
+          });
           await sleep(wait);
           attempt++;
           continue;
@@ -522,12 +630,14 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
     start = end;
   }
 
-  // Fetch final item by path (if this fails -> treat as success, return minimal)
   const itemUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}`;
   const item = await graphFetchRetry(itemUrl, { accessToken }, { max: 2 });
 
   if (!item.res.ok) {
-    console.warn(`⚠️ Uploaded but cannot fetch item for webUrl (ok to ignore): ${item.text}`);
+    log("WARN", "GRAPH_ITEM_FETCH_AFTER_UPLOAD_FAIL", {
+      hint: "ถือว่าอัปโหลดสำเร็จได้ (บางที webUrl fetch ล้มเหลว)",
+      text: item.text,
+    });
     return { id: null, name: path.basename(drivePath), webUrl: null };
   }
   return item.json || {};
@@ -571,7 +681,10 @@ app.get("/debug/sharepoint", async (req, res) => {
       const site = await graphFetchRetry(siteUrl, { accessToken });
       const siteId = site.json?.id;
       if (siteId) {
-        const drives = await graphFetchRetry(`https://graph.microsoft.com/v1.0/sites/${siteId}/drives`, { accessToken });
+        const drives = await graphFetchRetry(
+          `https://graph.microsoft.com/v1.0/sites/${siteId}/drives`,
+          { accessToken }
+        );
         drivesList = drives.json?.value || null;
       }
     }
@@ -590,60 +703,99 @@ app.get("/debug/sharepoint", async (req, res) => {
       GRAPH_TIMEOUT_MS,
       GRAPH_RETRY_MAX,
       GRAPH_RETRY_BASE_MS,
+      PUBLIC_BASE_URL,
+      KEEPALIVE_ENABLED,
+      KEEPALIVE_INTERVAL_MS,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/* -------------------- Webhook -------------------- */
+/* -------------------- Safe LINE send helpers -------------------- */
+async function safeReply(replyToken, messages, meta = {}) {
+  if (!replyToken) return;
+  try {
+    await client.replyMessage(replyToken, messages);
+    log("INFO", "LINE_REPLY_OK", meta);
+  } catch (e) {
+    log("ERROR", "LINE_REPLY_FAIL", { ...meta, err: String(e?.message || e) });
+  }
+}
+
+/* -------------------- Webhook (stable) -------------------- */
 app.post("/webhook", line.middleware(config), async (req, res) => {
-  // Reply fast to prevent LINE retry
+  const requestId = rid();
+  const t0 = Date.now();
+
+  // Reply fast to prevent LINE retry storms
   res.sendStatus(200);
 
   const events = req.body?.events || [];
   const baseUrl = buildPublicBaseUrl(req);
 
-  console.log("📩 Webhook triggered. Events:", events.length);
+  log("INFO", "WEBHOOK_RECEIVED", {
+    requestId,
+    events: events.length,
+    baseUrl,
+  });
 
-    
+  // Process each event independently (so 1 event fail won't kill others)
   for (const event of events) {
+    const evT0 = Date.now();
+
+    const srcType = event?.source?.type;
+    const groupId = event?.source?.groupId;
+    const roomId = event?.source?.roomId;
+    const userId = event?.source?.userId;
+
+    const evMeta = {
+      requestId,
+      eventType: event?.type,
+      messageType: event?.message?.type,
+      srcType,
+      groupTail: groupId ? groupId.slice(-6) : null,
+      roomTail: roomId ? roomId.slice(-6) : null,
+      userTail: userId ? userId.slice(-6) : null,
+    };
+
     try {
-console.log("📩 Webhook triggered. Events:", events.length);
-console.log("EVENT TYPE:", event.type);
-console.log("SOURCE:", event.source);
-console.log("MESSAGE:", event.message?.type);
+      // Production debug snapshot (ไม่พังแน่นอน เพราะอยู่ใน loop)
+      log("DEBUG", "EVENT_IN", {
+        ...evMeta,
+        source: event.source,
+      });
 
-console.log("ADMIN-CHECK:", {
-  srcType: event.source?.type,
-  userId: event.source?.userId,
-  groupId: event.source?.groupId,
-  roomId: event.source?.roomId,
-});
+      // Silent policy for "join" (ยังรับ event ได้ แต่ไม่ตอบในกลุ่ม)
+      if (event.type === "join") {
+        log("INFO", "EVENT_JOIN_IGNORED", evMeta);
+        continue;
+      }
 
-      const srcType = event.source?.type;
-
-      // Silent policy
-      if (event.type === "join") continue;
-
-      // follow happens in private
+      // follow in private chat
       if (event.type === "follow") {
         if (srcType === "user" && event.replyToken) {
-          await client.replyMessage(event.replyToken, [
-            { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว" },
-          ]);
+          await safeReply(
+            event.replyToken,
+            [{ type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว" }],
+            evMeta
+          );
         }
+        log("INFO", "EVENT_FOLLOW_HANDLED", { ...evMeta, ms: msSince(evT0) });
         continue;
       }
 
       // Only handle image messages
-      if (event.type !== "message" || event.message?.type !== "image") continue;
+      if (event.type !== "message" || event.message?.type !== "image") {
+        log("INFO", "EVENT_SKIPPED_NOT_IMAGE", { ...evMeta, ms: msSince(evT0) });
+        continue;
+      }
 
       const messageId = event.message.id;
 
       // dedupe
       if (seenMessageIds.has(messageId)) {
-        console.log("⚠️ Duplicate ignored:", messageId);
+        log("WARN", "DEDUPLICATE_IGNORED", { ...evMeta, messageId });
         continue;
       }
       rememberMessageId(messageId);
@@ -654,33 +806,32 @@ console.log("ADMIN-CHECK:", {
       const targetDir = path.join(baseImagesDir, folderName, day);
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
+      // Fetch content stream
       const stream = await client.getMessageContent(messageId);
-
       const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
-      const ext =
-        ct.includes("png") ? "png" :
-        ct.includes("jpeg") ? "jpg" :
-        ct.includes("jpg") ? "jpg" :
-        ct.includes("webp") ? "webp" :
-        "jpg";
+      const ext = extFromContentType(ct);
 
       const fileName = makeFileName(messageId, ext);
       const filePath = path.join(targetDir, fileName);
 
       await saveStreamToFile(stream, filePath);
-      console.log("✅ Saved local:", filePath);
+
+      log("INFO", "SAVED_LOCAL", {
+        ...evMeta,
+        messageId,
+        filePath,
+        contentType: ct,
+        ms: msSince(evT0),
+      });
 
       const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(fileName)}`;
       const localViewUrl = IMAGE_VIEW_TOKEN
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
         : `${baseUrl}${viewPath}`;
 
-      const contentType =
-        ext === "png" ? "image/png" :
-        ext === "webp" ? "image/webp" :
-        "image/jpeg";
+      const contentType = mimeFromExt(ext);
 
-      // LIMIT concurrent uploads
+      // Upload with concurrency limit
       const up = await uploadLimiter(() =>
         uploadToDrive({
           folderName: `${folderName}/${day}`,
@@ -690,29 +841,35 @@ console.log("ADMIN-CHECK:", {
         })
       );
 
-      console.log(`☁️ Uploaded (${up.storage}):`, up.drivePath, up.webUrl || "(no webUrl)");
+      log("INFO", "UPLOADED_DRIVE", {
+        ...evMeta,
+        drivePath: up.drivePath,
+        webUrl: up.webUrl,
+        size: up.size,
+        ms: msSince(evT0),
+      });
 
+      // Notify admin (silent in group/room)
       if (srcType === "group" || srcType === "room") {
         const msg =
-          `📸 มีรูปถูกส่งเข้ามา\n` +
+          `📸 รูปใหม่ถูกส่งเข้ามา\n` +
           `ที่: ${sourceLabel(event)}\n` +
-          `ผู้ส่ง: ${event.source?.userId || "-"}\n` +
           `โฟลเดอร์: ${folderName}\n` +
           `วันที่: ${day}\n` +
           `ไฟล์: ${fileName}\n` +
-          `Link: ${up.webUrl || "(ลิงก์อาจยังไม่พร้อม แต่ไฟล์อัปโหลดแล้ว)"}\n` +
+          `SharePoint: ${up.webUrl || "(ลิงก์อาจยังไม่พร้อม แต่ไฟล์อัปโหลดแล้ว)"}\n` +
           `Local: ${localViewUrl}`;
 
-        await notifyAdmin(msg);
-        // Silent in group/room
-      } else {
-        if (srcType === "user" && event.replyToken) {
-          await client.replyMessage(event.replyToken, [
-            { type: "text", text: `✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)` },
-          ]);
-        }
+        await notifyAdmin(msg, { ...evMeta, messageId });
+      } else if (srcType === "user" && event.replyToken) {
+        await safeReply(
+          event.replyToken,
+          [{ type: "text", text: `✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)` }],
+          { ...evMeta, messageId }
+        );
       }
 
+      // Cleanup local
       if (DELETE_LOCAL_AFTER_UPLOAD) {
         try {
           fs.unlinkSync(filePath);
@@ -725,25 +882,91 @@ console.log("ADMIN-CHECK:", {
           try {
             if (fs.existsSync(parentDir) && fs.readdirSync(parentDir).length === 0) fs.rmdirSync(parentDir);
           } catch {}
-        } catch {}
+
+          log("INFO", "LOCAL_CLEANUP_OK", { ...evMeta, messageId });
+        } catch (e) {
+          log("WARN", "LOCAL_CLEANUP_FAIL", { ...evMeta, messageId, err: String(e?.message || e) });
+        }
       }
+
+      log("INFO", "EVENT_DONE", { ...evMeta, messageId, ms: msSince(evT0) });
     } catch (err) {
-  console.error("❌ Error:", err?.message || err);
+      // Detailed error logging (Graph + LINE + FS)
+      const msg = String(err?.message || err);
 
-  const r = err?.originalError?.response || err?.response;
-  if (r) {
-    console.error("➡️ status:", r.status);
-    console.error("➡️ data:", r.data);
+      log("ERROR", "EVENT_FAIL", {
+        ...evMeta,
+        err: msg,
+        ms: msSince(evT0),
+      });
+
+      // Best-effort notify admin
+      await notifyAdmin(
+        `❌ SavePhotoBot Error\n` +
+          `req=${requestId}\n` +
+          `event=${event?.type}/${event?.message?.type || "-"}\n` +
+          `src=${srcType}\n` +
+          `err=${msg.slice(0, 1200)}`,
+        evMeta
+      );
+
+      // Continue to next event (do not crash webhook loop)
+      continue;
+    }
   }
 
-  // แจ้ง admin (best-effort)
+  log("INFO", "WEBHOOK_DONE", { requestId, ms: msSince(t0) });
+});
+
+/* -------------------- Keepalive (Render sleep mitigation) -------------------- */
+async function keepalivePing() {
+  if (!KEEPALIVE_ENABLED) return;
+  if (!PUBLIC_BASE_URL) {
+    log("WARN", "KEEPALIVE_SKIPPED_NO_PUBLIC_BASE_URL", {
+      hint: "ตั้ง PUBLIC_BASE_URL=https://...onrender.com เพื่อให้ keepalive ทำงาน",
+    });
+    return;
+  }
+
+  const url = `${PUBLIC_BASE_URL.replace(/\/$/, "")}/health`;
+
   try {
-    await notifyAdmin(`❌ SavePhotoBot Error: ${String(err?.message || err).slice(0, 900)}`);
-  } catch (_) {}
-}
+    const res = await fetchWithTimeout(url, { method: "GET" }, 15_000);
+    log("INFO", "KEEPALIVE_PING", { url, status: res.status });
+  } catch (e) {
+    log("WARN", "KEEPALIVE_FAIL", { url, err: String(e?.message || e) });
   }
+}
+
+// Start keepalive loop
+if (KEEPALIVE_ENABLED) {
+  setInterval(() => keepalivePing(), KEEPALIVE_INTERVAL_MS).unref?.();
+  // Fire once on boot
+  setTimeout(() => keepalivePing(), 10_000).unref?.();
+
+  log("INFO", "KEEPALIVE_ENABLED", {
+    PUBLIC_BASE_URL,
+    KEEPALIVE_INTERVAL_MS,
+    note:
+      "บน Render Free: แนะนำใช้ UptimeRobot/cron ภายนอกยิง /health ทุก 5 นาที จะกัน sleep ได้ชัวร์กว่า",
+  });
+}
+
+/* -------------------- Global crash guards -------------------- */
+process.on("unhandledRejection", (reason) => {
+  log("ERROR", "UNHANDLED_REJECTION", { reason: String(reason) });
+});
+process.on("uncaughtException", (err) => {
+  log("ERROR", "UNCAUGHT_EXCEPTION", { err: String(err?.message || err) });
 });
 
 /* -------------------- Start -------------------- */
 const PORT = Number(process.env.PORT || 3001);
-app.listen(PORT, () => console.log(`🚀 SavePhotoBot running on port ${PORT}`));
+app.listen(PORT, () => {
+  log("INFO", "SERVER_STARTED", {
+    port: PORT,
+    STORAGE_MODE,
+    UPLOAD_CONCURRENCY,
+    DELETE_LOCAL_AFTER_UPLOAD,
+  });
+});
