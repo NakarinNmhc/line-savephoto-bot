@@ -4,10 +4,14 @@
  * ✅ Production logging template (requestId, event summary, timing, structured error)
  * ✅ Stable webhook (no dropped events, per-event isolation, dedupe, safe reply/push)
  * ✅ Render sleep mitigation (keepalive ping + external ping suggestion)
+ * ✅ Support image + video + file
+ * ✅ Split folders by type: .../<date>/images|videos|files/
+ * ✅ Video size limit (skip if too large)
+ * ✅ File size limit (skip if too large)
  *
  * Notes:
- * - LINE middleware requires raw body verification; we keep `line.middleware(config)` as-is.
- * - We reply HTTP 200 ASAP to avoid LINE retry storms.
+ * - LINE middleware requires raw body verification; keep `line.middleware(config)` as-is.
+ * - Reply HTTP 200 ASAP to avoid LINE retry storms.
  */
 
 require("dotenv").config();
@@ -25,7 +29,7 @@ const LINE_ACCESS_TOKEN = process.env.LINE_ACCESS_TOKEN;
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID; // can be Uxxx or Cxxx or Rxxx
 
-// Optional: protect image viewing route
+// Optional: protect /images viewing route
 const IMAGE_VIEW_TOKEN = process.env.IMAGE_VIEW_TOKEN || "";
 
 // Microsoft Graph
@@ -73,6 +77,16 @@ const KEEPALIVE_INTERVAL_MS = Math.max(
   Number(process.env.KEEPALIVE_INTERVAL_MS || 300_000)
 );
 
+// Media controls
+const ALLOW_VIDEO = (process.env.ALLOW_VIDEO || "1") === "1";
+const ALLOW_FILE = (process.env.ALLOW_FILE || "1") === "1";
+
+const MAX_VIDEO_MB = Math.max(1, Number(process.env.MAX_VIDEO_MB || 30));
+const MAX_VIDEO_BYTES = MAX_VIDEO_MB * 1024 * 1024;
+
+const MAX_FILE_MB = Math.max(1, Number(process.env.MAX_FILE_MB || 20));
+const MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024;
+
 /* -------------------- Validate env -------------------- */
 function looksLikeLineId(id) {
   // LINE IDs typically start with U (user), C (group), R (room)
@@ -118,7 +132,8 @@ app.get("/health", (req, res) => res.status(200).send("OK"));
 
 /* -------------------- Storage (local temp) -------------------- */
 const baseImagesDir = path.join(__dirname, "images");
-if (!fs.existsSync(baseImagesDir)) fs.mkdirSync(baseImagesDir, { recursive: true });
+if (!fs.existsSync(baseImagesDir))
+  fs.mkdirSync(baseImagesDir, { recursive: true });
 
 /* -------------------- Static route (Express 5 safe) -------------------- */
 app.get(/^\/images\/.*/, (req, res, next) => {
@@ -143,15 +158,13 @@ function safeJson(v) {
   }
 }
 function log(level, msg, meta = {}) {
-  // level: INFO | WARN | ERROR | DEBUG
   const line = {
     ts: nowISO(),
     level,
     msg,
     ...meta,
   };
-  // keep log single-line JSON for Render readability
-  console.log(safeJson(line));
+  console.log(safeJson(line)); // single-line JSON
 }
 function msSince(t0) {
   return Date.now() - t0;
@@ -165,11 +178,14 @@ function dateFolder() {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
-function makeFileName(messageId, ext = "jpg") {
+function makeFileNamePrefix(messageId) {
   const d = new Date();
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(
     d.getDate()
-  )}_${messageId}.${ext}`;
+  )}_${messageId}`;
+}
+function makeFileName(messageId, ext = "jpg") {
+  return `${makeFileNamePrefix(messageId)}.${ext}`;
 }
 function sanitizeFolderName(name) {
   return String(name || "")
@@ -177,6 +193,24 @@ function sanitizeFolderName(name) {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 80);
+}
+function sanitizeFileName(name) {
+  const base = String(name || "")
+    .replace(/[/\\]/g, "_")
+    .replace(/[<>:"|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+  return base ? base.slice(0, 120) : "file";
+}
+function getExtFromFileName(name) {
+  const n = String(name || "").trim();
+  const idx = n.lastIndexOf(".");
+  if (idx <= 0 || idx === n.length - 1) return "";
+  return n
+    .slice(idx + 1)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 10);
 }
 function saveStreamToFile(stream, filePath) {
   return new Promise((resolve, reject) => {
@@ -187,11 +221,46 @@ function saveStreamToFile(stream, filePath) {
     stream.on("error", reject);
   });
 }
-function buildPublicBaseUrl(req) {
-  // Prefer explicit PUBLIC_BASE_URL (best for Render)
-  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+function saveStreamToFileWithLimit(stream, filePath, maxBytes) {
+  return new Promise((resolve, reject) => {
+    let written = 0;
+    const w = fs.createWriteStream(filePath);
 
-  // fallback from headers
+    const cleanup = () => {
+      try {
+        w.destroy();
+      } catch {}
+      try {
+        stream.destroy();
+      } catch {}
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {}
+    };
+
+    stream.on("data", (chunk) => {
+      written += chunk.length;
+      if (written > maxBytes) {
+        cleanup();
+        reject(new Error("TOO_LARGE"));
+      }
+    });
+
+    w.on("finish", resolve);
+    w.on("error", (e) => {
+      cleanup();
+      reject(e);
+    });
+    stream.on("error", (e) => {
+      cleanup();
+      reject(e);
+    });
+
+    stream.pipe(w);
+  });
+}
+function buildPublicBaseUrl(req) {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
   const proto = req.headers["x-forwarded-proto"] || "https";
   const host = req.headers["x-forwarded-host"] || req.headers.host;
   return `${proto}://${host}`;
@@ -218,16 +287,40 @@ function isTransientStatus(status) {
 }
 function extFromContentType(ct) {
   const c = String(ct || "").toLowerCase();
-  if (c.includes("png")) return "png";
-  if (c.includes("webp")) return "webp";
-  if (c.includes("jpeg")) return "jpg";
-  if (c.includes("jpg")) return "jpg";
-  return "jpg";
+  if (c.includes("image/png")) return "png";
+  if (c.includes("image/webp")) return "webp";
+  if (c.includes("image/jpeg") || c.includes("image/jpg")) return "jpg";
+
+  if (c.includes("video/mp4")) return "mp4";
+  if (c.includes("video/quicktime")) return "mov";
+  if (c.includes("video/3gpp")) return "3gp";
+
+  if (c.includes("application/pdf")) return "pdf";
+  if (c.includes("application/zip")) return "zip";
+  if (c.includes("text/plain")) return "txt";
+
+  return "bin";
 }
 function mimeFromExt(ext) {
-  if (ext === "png") return "image/png";
-  if (ext === "webp") return "image/webp";
-  return "image/jpeg";
+  const e = String(ext || "").toLowerCase();
+  if (e === "png") return "image/png";
+  if (e === "webp") return "image/webp";
+  if (e === "jpg" || e === "jpeg") return "image/jpeg";
+
+  if (e === "mp4") return "video/mp4";
+  if (e === "mov") return "video/quicktime";
+  if (e === "3gp") return "video/3gpp";
+
+  if (e === "pdf") return "application/pdf";
+  if (e === "zip") return "application/zip";
+  if (e === "txt") return "text/plain; charset=utf-8";
+
+  return "application/octet-stream";
+}
+function typeSubFolder(messageType) {
+  if (messageType === "image") return "images";
+  if (messageType === "video") return "videos";
+  return "files";
 }
 
 /* -------------------- Simple concurrency limiter -------------------- */
@@ -260,14 +353,11 @@ const uploadLimiter = createLimiter(UPLOAD_CONCURRENCY);
 
 /* -------------------- Notify admin (push) with safety -------------------- */
 async function notifyAdmin(text, meta = {}) {
-  // Avoid LINE max message length issues
   const msg = String(text || "").slice(0, 4900);
-
   try {
     await client.pushMessage(ADMIN_USER_ID, [{ type: "text", text: msg }]);
     log("INFO", "ADMIN_NOTIFY_OK", meta);
   } catch (e) {
-    // This is where you used to get: "The property, 'to', is invalid"
     log("ERROR", "ADMIN_NOTIFY_FAIL", {
       ...meta,
       err: String(e?.message || e),
@@ -386,7 +476,10 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = GRAPH_TIMEOUT_MS)
   }
 }
 
-async function graphFetch(url, { accessToken, method = "GET", headers = {}, body, timeoutMs } = {}) {
+async function graphFetch(
+  url,
+  { accessToken, method = "GET", headers = {}, body, timeoutMs } = {}
+) {
   const res = await fetchWithTimeout(
     url,
     {
@@ -543,7 +636,13 @@ async function ensureDriveFolder(accessToken, driveBase, folderPath) {
   }
 }
 
-async function uploadSmall(accessToken, driveBase, drivePath, buffer, contentType) {
+async function uploadSmall(
+  accessToken,
+  driveBase,
+  drivePath,
+  buffer,
+  contentType
+) {
   const url = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/content`;
 
   const out = await graphFetchRetry(url, {
@@ -559,15 +658,20 @@ async function uploadSmall(accessToken, driveBase, drivePath, buffer, contentTyp
 }
 
 async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
-  const createUrl = `${driveBase}/root:/${encodeGraphPath(drivePath)}:/createUploadSession`;
+  const createUrl = `${driveBase}/root:/${encodeGraphPath(
+    drivePath
+  )}:/createUploadSession`;
   const created = await graphFetchRetry(createUrl, {
     accessToken,
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "replace" } }),
+    body: JSON.stringify({
+      item: { "@microsoft.graph.conflictBehavior": "replace" },
+    }),
   });
 
-  if (!created.res.ok) throw new Error(`CreateUploadSession failed: ${created.text}`);
+  if (!created.res.ok)
+    throw new Error(`CreateUploadSession failed: ${created.text}`);
   const uploadUrl = created.json?.uploadUrl;
   if (!uploadUrl) throw new Error("CreateUploadSession: missing uploadUrl");
 
@@ -595,7 +699,8 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
           Math.max(GRAPH_TIMEOUT_MS, 120_000)
         );
 
-        if (res.status === 200 || res.status === 201 || res.status === 202) break;
+        if (res.status === 200 || res.status === 201 || res.status === 202)
+          break;
 
         const txt = await res.text();
         if (isTransientStatus(res.status) && attempt < GRAPH_RETRY_MAX) {
@@ -610,7 +715,9 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
           continue;
         }
 
-        throw new Error(`Chunk upload failed (${start}-${end - 1}) status=${res.status}: ${txt}`);
+        throw new Error(
+          `Chunk upload failed (${start}-${end - 1}) status=${res.status}: ${txt}`
+        );
       } catch (e) {
         if (attempt < GRAPH_RETRY_MAX) {
           const wait = GRAPH_RETRY_BASE_MS * Math.pow(2, attempt);
@@ -706,6 +813,10 @@ app.get("/debug/sharepoint", async (req, res) => {
       PUBLIC_BASE_URL,
       KEEPALIVE_ENABLED,
       KEEPALIVE_INTERVAL_MS,
+      ALLOW_VIDEO,
+      ALLOW_FILE,
+      MAX_VIDEO_MB,
+      MAX_FILE_MB,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
@@ -740,7 +851,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
     baseUrl,
   });
 
-  // Process each event independently (so 1 event fail won't kill others)
   for (const event of events) {
     const evT0 = Date.now();
 
@@ -760,13 +870,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
     };
 
     try {
-      // Production debug snapshot (ไม่พังแน่นอน เพราะอยู่ใน loop)
       log("DEBUG", "EVENT_IN", {
         ...evMeta,
         source: event.source,
       });
 
-      // Silent policy for "join" (ยังรับ event ได้ แต่ไม่ตอบในกลุ่ม)
+      // Silent policy for "join"
       if (event.type === "join") {
         log("INFO", "EVENT_JOIN_IGNORED", evMeta);
         continue;
@@ -777,7 +886,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         if (srcType === "user" && event.replyToken) {
           await safeReply(
             event.replyToken,
-            [{ type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับรูปแล้ว" }],
+            [{ type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับไฟล์แล้ว" }],
             evMeta
           );
         }
@@ -785,15 +894,28 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         continue;
       }
 
-      // Only handle image messages
-      if (event.type !== "message" || event.message?.type !== "image") {
-        log("INFO", "EVENT_SKIPPED_NOT_IMAGE", { ...evMeta, ms: msSince(evT0) });
+      if (event.type !== "message") {
+        log("INFO", "EVENT_SKIPPED_NOT_MESSAGE", { ...evMeta, ms: msSince(evT0) });
+        continue;
+      }
+
+      const mtype = event.message?.type; // image | video | file | text | ...
+      if (mtype === "video" && !ALLOW_VIDEO) {
+        log("INFO", "EVENT_SKIPPED_VIDEO_DISABLED", { ...evMeta, ms: msSince(evT0) });
+        continue;
+      }
+      if (mtype === "file" && !ALLOW_FILE) {
+        log("INFO", "EVENT_SKIPPED_FILE_DISABLED", { ...evMeta, ms: msSince(evT0) });
+        continue;
+      }
+      if (!["image", "video", "file"].includes(mtype)) {
+        log("INFO", "EVENT_SKIPPED_UNSUPPORTED_TYPE", { ...evMeta, ms: msSince(evT0) });
         continue;
       }
 
       const messageId = event.message.id;
 
-      // dedupe
+      // dedupe by messageId
       if (seenMessageIds.has(messageId)) {
         log("WARN", "DEDUPLICATE_IGNORED", { ...evMeta, messageId });
         continue;
@@ -802,19 +924,91 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const folderName = await getSourceFolder(event);
       const day = dateFolder();
+      const sub = typeSubFolder(mtype);
 
-      const targetDir = path.join(baseImagesDir, folderName, day);
+      const targetDir = path.join(baseImagesDir, folderName, day, sub);
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
       // Fetch content stream
       const stream = await client.getMessageContent(messageId);
       const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
-      const ext = extFromContentType(ct);
 
-      const fileName = makeFileName(messageId, ext);
+      // decide filename/ext
+      let ext = extFromContentType(ct);
+      let fileName = "";
+
+      if (mtype === "file") {
+        const original = sanitizeFileName(event.message.fileName || `file_${messageId}`);
+        const fromNameExt = getExtFromFileName(original);
+        if (fromNameExt) ext = fromNameExt;
+
+        fileName = `${makeFileNamePrefix(messageId)}_${original}`;
+      } else {
+        if (mtype === "video" && (ext === "bin" || !ext)) ext = "mp4";
+        if (!ext) ext = "bin";
+        fileName = makeFileName(messageId, ext);
+      }
+
+      // avoid too-long file names for SharePoint
+      if (fileName.length > 160) {
+        const keepExt = getExtFromFileName(fileName) || ext;
+        fileName = `${makeFileNamePrefix(messageId)}.${keepExt}`;
+      }
+
       const filePath = path.join(targetDir, fileName);
 
-      await saveStreamToFile(stream, filePath);
+      // Save local with limits
+      if (mtype === "video") {
+        try {
+          await saveStreamToFileWithLimit(stream, filePath, MAX_VIDEO_BYTES);
+        } catch (e) {
+          if (String(e?.message || e).includes("TOO_LARGE")) {
+            log("WARN", "VIDEO_TOO_LARGE_SKIPPED", {
+              ...evMeta,
+              messageId,
+              maxMB: MAX_VIDEO_MB,
+            });
+
+            await notifyAdmin(
+              `🚫 ข้ามวิดีโอ (ใหญ่เกิน ${MAX_VIDEO_MB}MB)\n` +
+                `ที่: ${sourceLabel(event)}\n` +
+                `โฟลเดอร์: ${folderName}\n` +
+                `วันที่: ${day}\n` +
+                `messageId: ${messageId}`,
+              { ...evMeta, messageId }
+            );
+            continue;
+          }
+          throw e;
+        }
+      } else if (mtype === "file") {
+        try {
+          await saveStreamToFileWithLimit(stream, filePath, MAX_FILE_BYTES);
+        } catch (e) {
+          if (String(e?.message || e).includes("TOO_LARGE")) {
+            log("WARN", "FILE_TOO_LARGE_SKIPPED", {
+              ...evMeta,
+              messageId,
+              maxMB: MAX_FILE_MB,
+              fileName,
+            });
+
+            await notifyAdmin(
+              `🚫 ข้ามไฟล์ (ใหญ่เกิน ${MAX_FILE_MB}MB)\n` +
+                `ที่: ${sourceLabel(event)}\n` +
+                `โฟลเดอร์: ${folderName}\n` +
+                `วันที่: ${day}\n` +
+                `ไฟล์: ${fileName}\n` +
+                `messageId: ${messageId}`,
+              { ...evMeta, messageId }
+            );
+            continue;
+          }
+          throw e;
+        }
+      } else {
+        await saveStreamToFile(stream, filePath);
+      }
 
       log("INFO", "SAVED_LOCAL", {
         ...evMeta,
@@ -824,7 +1018,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ms: msSince(evT0),
       });
 
-      const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(fileName)}`;
+      // Local view URL (only works if you keep local files; you delete after upload by default)
+      const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(sub)}/${encodeURIComponent(fileName)}`;
       const localViewUrl = IMAGE_VIEW_TOKEN
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
         : `${baseUrl}${viewPath}`;
@@ -834,7 +1029,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       // Upload with concurrency limit
       const up = await uploadLimiter(() =>
         uploadToDrive({
-          folderName: `${folderName}/${day}`,
+          folderName: `${folderName}/${day}/${sub}`,
           fileName,
           localFilePath: filePath,
           contentType,
@@ -849,13 +1044,17 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ms: msSince(evT0),
       });
 
+      const kindLabel =
+        mtype === "image" ? "📸 รูป" : mtype === "video" ? "🎬 วิดีโอ" : "📎 ไฟล์";
+
       // Notify admin (silent in group/room)
       if (srcType === "group" || srcType === "room") {
         const msg =
-          `📸 รูปใหม่ถูกส่งเข้ามา\n` +
+          `${kindLabel} ใหม่ถูกส่งเข้ามา\n` +
           `ที่: ${sourceLabel(event)}\n` +
           `โฟลเดอร์: ${folderName}\n` +
           `วันที่: ${day}\n` +
+          `ชนิด: ${sub}\n` +
           `ไฟล์: ${fileName}\n` +
           `SharePoint: ${up.webUrl || "(ลิงก์อาจยังไม่พร้อม แต่ไฟล์อัปโหลดแล้ว)"}\n` +
           `Local: ${localViewUrl}`;
@@ -864,7 +1063,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       } else if (srcType === "user" && event.replyToken) {
         await safeReply(
           event.replyToken,
-          [{ type: "text", text: `✅ บันทึกรูปแล้วครับ (อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)` }],
+          [
+            {
+              type: "text",
+              text:
+                `✅ บันทึก${mtype === "image" ? "รูป" : mtype === "video" ? "วิดีโอ" : "ไฟล์"}แล้วครับ ` +
+                `(อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)`,
+            },
+          ],
           { ...evMeta, messageId }
         );
       }
@@ -874,24 +1080,36 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         try {
           fs.unlinkSync(filePath);
 
+          // remove empty sub/date/source dirs (best-effort)
           try {
-            if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0) fs.rmdirSync(targetDir);
+            if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0)
+              fs.rmdirSync(targetDir);
+          } catch {}
+
+          const dayDir = path.join(baseImagesDir, folderName, day);
+          try {
+            if (fs.existsSync(dayDir) && fs.readdirSync(dayDir).length === 0)
+              fs.rmdirSync(dayDir);
           } catch {}
 
           const parentDir = path.join(baseImagesDir, folderName);
           try {
-            if (fs.existsSync(parentDir) && fs.readdirSync(parentDir).length === 0) fs.rmdirSync(parentDir);
+            if (fs.existsSync(parentDir) && fs.readdirSync(parentDir).length === 0)
+              fs.rmdirSync(parentDir);
           } catch {}
 
           log("INFO", "LOCAL_CLEANUP_OK", { ...evMeta, messageId });
         } catch (e) {
-          log("WARN", "LOCAL_CLEANUP_FAIL", { ...evMeta, messageId, err: String(e?.message || e) });
+          log("WARN", "LOCAL_CLEANUP_FAIL", {
+            ...evMeta,
+            messageId,
+            err: String(e?.message || e),
+          });
         }
       }
 
       log("INFO", "EVENT_DONE", { ...evMeta, messageId, ms: msSince(evT0) });
     } catch (err) {
-      // Detailed error logging (Graph + LINE + FS)
       const msg = String(err?.message || err);
 
       log("ERROR", "EVENT_FAIL", {
@@ -900,7 +1118,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         ms: msSince(evT0),
       });
 
-      // Best-effort notify admin
       await notifyAdmin(
         `❌ SavePhotoBot Error\n` +
           `req=${requestId}\n` +
@@ -910,7 +1127,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         evMeta
       );
 
-      // Continue to next event (do not crash webhook loop)
       continue;
     }
   }
@@ -938,10 +1154,8 @@ async function keepalivePing() {
   }
 }
 
-// Start keepalive loop
 if (KEEPALIVE_ENABLED) {
   setInterval(() => keepalivePing(), KEEPALIVE_INTERVAL_MS).unref?.();
-  // Fire once on boot
   setTimeout(() => keepalivePing(), 10_000).unref?.();
 
   log("INFO", "KEEPALIVE_ENABLED", {
@@ -968,5 +1182,9 @@ app.listen(PORT, () => {
     STORAGE_MODE,
     UPLOAD_CONCURRENCY,
     DELETE_LOCAL_AFTER_UPLOAD,
+    ALLOW_VIDEO,
+    ALLOW_FILE,
+    MAX_VIDEO_MB,
+    MAX_FILE_MB,
   });
 });
