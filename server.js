@@ -606,8 +606,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
   console.log("📩 Webhook triggered. Events:", events.length);
 
+    
   for (const event of events) {
     try {
+console.log("📩 Webhook triggered. Events:", events.length);
+console.log("EVENT TYPE:", event.type);
+console.log("SOURCE:", event.source);
+console.log("MESSAGE:", event.message?.type);
+
 console.log("ADMIN-CHECK:", {
   srcType: event.source?.type,
   userId: event.source?.userId,
