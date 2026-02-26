@@ -13,6 +13,11 @@
  *   Root: ONEDRIVE_BASE_PATH=SavePhotoBotUser (default)
  *   Path: <root>/<sourceFolder>/<senderFolder>/<images|videos|files>/<file>
  *
+ * ✅ FILE NAMING (pretty):
+ *   Image: YYYY-MM-DD_HH-mm-ss_IMG_<shortId>.jpg
+ *   Video: YYYY-MM-DD_HH-mm-ss_VID_<shortId>.mp4
+ *   File : YYYY-MM-DD_HH-mm-ss_FILE_<shortId>_<originalName>.pdf (trim if too long)
+ *
  * Notes:
  * - LINE middleware requires raw body verification; keep `line.middleware(config)` as-is.
  * - Reply HTTP 200 ASAP to avoid LINE retry storms.
@@ -189,6 +194,47 @@ function makeFileNamePrefix(messageId) {
 function makeFileName(messageId, ext = "jpg") {
   return `${makeFileNamePrefix(messageId)}.${ext}`;
 }
+
+/**
+ * ✅ Pretty file name:
+ * - image/video: YYYY-MM-DD_HH-mm-ss_IMG|VID_<shortId>.ext
+ * - file:        YYYY-MM-DD_HH-mm-ss_FILE_<shortId>_<originalName>.ext
+ */
+function makePrettyFileName(messageId, type, ext, originalName = "") {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+
+  const shortId = String(messageId || "").slice(-6) || "000000";
+
+  let label = "FILE";
+  if (type === "image") label = "IMG";
+  if (type === "video") label = "VID";
+
+  // sanitize original name (optional)
+  const safeOriginal = String(originalName || "")
+    .replace(/[/\\]/g, "_")
+    .replace(/[<>:"|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const base = `${yyyy}-${mm}-${dd}_${hh}-${mi}-${ss}_${label}_${shortId}`;
+
+  // if file and has original name, append it (without duplicating extension)
+  if (type === "file" && safeOriginal) {
+    const nameNoExt = safeOriginal.replace(/\.[^.]+$/, "");
+    const tail = nameNoExt ? `_${nameNoExt}` : "";
+    return `${base}${tail}.${ext}`;
+  }
+
+  return `${base}.${ext}`;
+}
+
 function sanitizeFolderName(name) {
   return String(name || "")
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -426,7 +472,8 @@ async function getSenderFolder(event) {
   const cacheKey = `${s.type}:${scopeId}:${userId}`;
 
   const cached = senderCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < SENDER_CACHE_TTL_MS) return cached.folder;
+  if (cached && Date.now() - cached.ts < SENDER_CACHE_TTL_MS)
+    return cached.folder;
 
   try {
     let profile = null;
@@ -935,7 +982,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         if (srcType === "user" && event.replyToken) {
           await safeReply(
             event.replyToken,
-            [{ type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับไฟล์แล้ว" }],
+            [
+              { type: "text", text: "สวัสดีครับ 🙂 SavePhotoBot พร้อมรับไฟล์แล้ว" },
+            ],
             evMeta
           );
         }
@@ -984,19 +1033,21 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       rememberMessageId(messageId);
 
       // ✅ NO day folder
-      const folderName = await getSourceFolder(event);     // group_xxx / room_xxx / private
-      const senderFolder = await getSenderFolder(event);   // user_<name>_<tail> or user_<tail>
+      const folderName = await getSourceFolder(event); // group_xxx / room_xxx / private
+      const senderFolder = await getSenderFolder(event); // user_<name>_<tail> or user_<tail>
       const sub = typeSubFolder(mtype);
 
       const targetDir = path.join(baseImagesDir, folderName, senderFolder, sub);
-      if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
+      if (!fs.existsSync(targetDir))
+        fs.mkdirSync(targetDir, { recursive: true });
 
       // Fetch content stream
       const stream = await client.getMessageContent(messageId);
       const ct = (stream?.headers?.["content-type"] || "").toLowerCase();
 
-      // decide filename/ext
+      // decide filename/ext ✅ (UPDATED)
       let ext = extFromContentType(ct);
+      if (!ext) ext = "bin";
       let fileName = "";
 
       if (mtype === "file") {
@@ -1006,17 +1057,21 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         const fromNameExt = getExtFromFileName(original);
         if (fromNameExt) ext = fromNameExt;
 
-        fileName = `${makeFileNamePrefix(messageId)}_${original}`;
+        // Pretty + keep original name
+        fileName = makePrettyFileName(messageId, "file", ext, original);
       } else {
         if (mtype === "video" && (ext === "bin" || !ext)) ext = "mp4";
-        if (!ext) ext = "bin";
-        fileName = makeFileName(messageId, ext);
+        fileName = makePrettyFileName(messageId, mtype, ext);
       }
 
-      // avoid too-long file names for SharePoint
+      // avoid too-long file names for SharePoint (best-effort)
       if (fileName.length > 160) {
-        const keepExt = getExtFromFileName(fileName) || ext;
-        fileName = `${makeFileNamePrefix(messageId)}.${keepExt}`;
+        // shorten: keep only pretty base (drop original)
+        fileName = makePrettyFileName(messageId, mtype === "file" ? "file" : mtype, ext);
+      }
+      if (fileName.length > 160) {
+        // ultimate fallback
+        fileName = `${makeFileNamePrefix(messageId)}.${ext}`;
       }
 
       const filePath = path.join(targetDir, fileName);
@@ -1141,7 +1196,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
               type: "text",
               text:
                 `✅ บันทึก${
-                  mtype === "image" ? "รูป" : mtype === "video" ? "วิดีโอ" : "ไฟล์"
+                  mtype === "image"
+                    ? "รูป"
+                    : mtype === "video"
+                    ? "วิดีโอ"
+                    : "ไฟล์"
                 }แล้วครับ ` + `(อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)`,
             },
           ],
@@ -1156,19 +1215,28 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
           // remove empty sub/sender/source dirs (best-effort)
           try {
-            if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0)
+            if (
+              fs.existsSync(targetDir) &&
+              fs.readdirSync(targetDir).length === 0
+            )
               fs.rmdirSync(targetDir);
           } catch {}
 
           const senderDir = path.join(baseImagesDir, folderName, senderFolder);
           try {
-            if (fs.existsSync(senderDir) && fs.readdirSync(senderDir).length === 0)
+            if (
+              fs.existsSync(senderDir) &&
+              fs.readdirSync(senderDir).length === 0
+            )
               fs.rmdirSync(senderDir);
           } catch {}
 
           const parentDir = path.join(baseImagesDir, folderName);
           try {
-            if (fs.existsSync(parentDir) && fs.readdirSync(parentDir).length === 0)
+            if (
+              fs.existsSync(parentDir) &&
+              fs.readdirSync(parentDir).length === 0
+            )
               fs.rmdirSync(parentDir);
           } catch {}
 
@@ -1268,5 +1336,6 @@ app.listen(PORT, () => {
     MAX_VIDEO_MB,
     MAX_FILE_MB,
     structure: "<root>/<source>/<sender>/<type>/file",
+    fileNaming: "YYYY-MM-DD_HH-mm-ss_{IMG|VID|FILE}_{shortId}[_original].ext",
   });
 });
