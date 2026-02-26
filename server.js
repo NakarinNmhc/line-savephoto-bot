@@ -1,13 +1,17 @@
 /**
- * SavePhotoBot - server.js (Production-ready)
+ * SavePhotoBot - server.js (Production-ready) ✅ SavePhotoBotUser (User-centric folders, NO day folder)
  * Goals:
  * ✅ Production logging template (requestId, event summary, timing, structured error)
  * ✅ Stable webhook (no dropped events, per-event isolation, dedupe, safe reply/push)
  * ✅ Render sleep mitigation (keepalive ping + external ping suggestion)
  * ✅ Support image + video + file
- * ✅ Split folders by type: .../<date>/images|videos|files/
+ * ✅ Split folders by type: .../<source>/<sender>/<images|videos|files>/<file>
  * ✅ Video size limit (skip if too large)
  * ✅ File size limit (skip if too large)
+ *
+ * ✅ STRUCTURE (NO day):
+ *   Root: ONEDRIVE_BASE_PATH=SavePhotoBotUser (default)
+ *   Path: <root>/<sourceFolder>/<senderFolder>/<images|videos|files>/<file>
  *
  * Notes:
  * - LINE middleware requires raw body verification; keep `line.middleware(config)` as-is.
@@ -42,7 +46,9 @@ const MS_SCOPES =
 
 // Storage selection
 const STORAGE_MODE = (process.env.STORAGE_MODE || "sharepoint").toLowerCase(); // sharepoint | onedrive
-const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBot";
+
+// ✅ Default root changed to SavePhotoBotUser
+const ONEDRIVE_BASE_PATH = process.env.ONEDRIVE_BASE_PATH || "SavePhotoBotUser";
 
 // SharePoint target
 const SP_HOSTNAME = process.env.SP_HOSTNAME || "";
@@ -173,10 +179,6 @@ function msSince(t0) {
 /* -------------------- Helpers -------------------- */
 function pad(n) {
   return String(n).padStart(2, "0");
-}
-function dateFolder() {
-  const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function makeFileNamePrefix(messageId) {
   const d = new Date();
@@ -403,6 +405,48 @@ async function getSourceFolder(event) {
   }
 
   return "unknown";
+}
+
+/* -------------------- Cache: sender folder (User-centric) -------------------- */
+const senderCache = new Map(); // key: `${srcType}:${scopeId}:${userId}`
+const SENDER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+function buildSenderFolder(userId, displayName) {
+  const tail = String(userId || "unknown").slice(-6);
+  const name = sanitizeFolderName(displayName || "");
+  return name ? `user_${name}_${tail}` : `user_${tail}`;
+}
+
+async function getSenderFolder(event) {
+  const s = event.source || {};
+  const userId = s.userId;
+  if (!userId) return "user_unknown";
+
+  const scopeId = s.groupId || s.roomId || "private";
+  const cacheKey = `${s.type}:${scopeId}:${userId}`;
+
+  const cached = senderCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < SENDER_CACHE_TTL_MS) return cached.folder;
+
+  try {
+    let profile = null;
+
+    if (s.type === "group" && s.groupId) {
+      profile = await client.getGroupMemberProfile(s.groupId, userId);
+    } else if (s.type === "room" && s.roomId) {
+      profile = await client.getRoomMemberProfile(s.roomId, userId);
+    } else {
+      profile = await client.getProfile(userId);
+    }
+
+    const folder = buildSenderFolder(userId, profile?.displayName || "");
+    senderCache.set(cacheKey, { folder, ts: Date.now() });
+    return folder;
+  } catch {
+    const folder = buildSenderFolder(userId, "");
+    senderCache.set(cacheKey, { folder, ts: Date.now() });
+    return folder;
+  }
 }
 
 /* -------------------- Dedupe (webhook retry) -------------------- */
@@ -750,7 +794,12 @@ async function uploadLarge(accessToken, driveBase, drivePath, buffer) {
   return item.json || {};
 }
 
-async function uploadToDrive({ folderName, fileName, localFilePath, contentType }) {
+async function uploadToDrive({
+  folderName,
+  fileName,
+  localFilePath,
+  contentType,
+}) {
   const accessToken = await getGraphAccessToken();
   const driveBase = await getDriveBase(accessToken);
 
@@ -895,21 +944,33 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
 
       if (event.type !== "message") {
-        log("INFO", "EVENT_SKIPPED_NOT_MESSAGE", { ...evMeta, ms: msSince(evT0) });
+        log("INFO", "EVENT_SKIPPED_NOT_MESSAGE", {
+          ...evMeta,
+          ms: msSince(evT0),
+        });
         continue;
       }
 
       const mtype = event.message?.type; // image | video | file | text | ...
       if (mtype === "video" && !ALLOW_VIDEO) {
-        log("INFO", "EVENT_SKIPPED_VIDEO_DISABLED", { ...evMeta, ms: msSince(evT0) });
+        log("INFO", "EVENT_SKIPPED_VIDEO_DISABLED", {
+          ...evMeta,
+          ms: msSince(evT0),
+        });
         continue;
       }
       if (mtype === "file" && !ALLOW_FILE) {
-        log("INFO", "EVENT_SKIPPED_FILE_DISABLED", { ...evMeta, ms: msSince(evT0) });
+        log("INFO", "EVENT_SKIPPED_FILE_DISABLED", {
+          ...evMeta,
+          ms: msSince(evT0),
+        });
         continue;
       }
       if (!["image", "video", "file"].includes(mtype)) {
-        log("INFO", "EVENT_SKIPPED_UNSUPPORTED_TYPE", { ...evMeta, ms: msSince(evT0) });
+        log("INFO", "EVENT_SKIPPED_UNSUPPORTED_TYPE", {
+          ...evMeta,
+          ms: msSince(evT0),
+        });
         continue;
       }
 
@@ -922,11 +983,12 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
       rememberMessageId(messageId);
 
-      const folderName = await getSourceFolder(event);
-      const day = dateFolder();
+      // ✅ NO day folder
+      const folderName = await getSourceFolder(event);     // group_xxx / room_xxx / private
+      const senderFolder = await getSenderFolder(event);   // user_<name>_<tail> or user_<tail>
       const sub = typeSubFolder(mtype);
 
-      const targetDir = path.join(baseImagesDir, folderName, day, sub);
+      const targetDir = path.join(baseImagesDir, folderName, senderFolder, sub);
       if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, { recursive: true });
 
       // Fetch content stream
@@ -938,7 +1000,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       let fileName = "";
 
       if (mtype === "file") {
-        const original = sanitizeFileName(event.message.fileName || `file_${messageId}`);
+        const original = sanitizeFileName(
+          event.message.fileName || `file_${messageId}`
+        );
         const fromNameExt = getExtFromFileName(original);
         if (fromNameExt) ext = fromNameExt;
 
@@ -973,7 +1037,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
               `🚫 ข้ามวิดีโอ (ใหญ่เกิน ${MAX_VIDEO_MB}MB)\n` +
                 `ที่: ${sourceLabel(event)}\n` +
                 `โฟลเดอร์: ${folderName}\n` +
-                `วันที่: ${day}\n` +
+                `ผู้ส่ง: ${senderFolder}\n` +
+                `ชนิด: ${sub}\n` +
                 `messageId: ${messageId}`,
               { ...evMeta, messageId }
             );
@@ -997,7 +1062,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
               `🚫 ข้ามไฟล์ (ใหญ่เกิน ${MAX_FILE_MB}MB)\n` +
                 `ที่: ${sourceLabel(event)}\n` +
                 `โฟลเดอร์: ${folderName}\n` +
-                `วันที่: ${day}\n` +
+                `ผู้ส่ง: ${senderFolder}\n` +
+                `ชนิด: ${sub}\n` +
                 `ไฟล์: ${fileName}\n` +
                 `messageId: ${messageId}`,
               { ...evMeta, messageId }
@@ -1015,11 +1081,17 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         messageId,
         filePath,
         contentType: ct,
+        senderFolder,
         ms: msSince(evT0),
       });
 
       // Local view URL (only works if you keep local files; you delete after upload by default)
-      const viewPath = `/images/${encodeURIComponent(folderName)}/${encodeURIComponent(day)}/${encodeURIComponent(sub)}/${encodeURIComponent(fileName)}`;
+      const viewPath =
+        `/images/${encodeURIComponent(folderName)}` +
+        `/${encodeURIComponent(senderFolder)}` +
+        `/${encodeURIComponent(sub)}` +
+        `/${encodeURIComponent(fileName)}`;
+
       const localViewUrl = IMAGE_VIEW_TOKEN
         ? `${baseUrl}${viewPath}?token=${encodeURIComponent(IMAGE_VIEW_TOKEN)}`
         : `${baseUrl}${viewPath}`;
@@ -1029,7 +1101,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       // Upload with concurrency limit
       const up = await uploadLimiter(() =>
         uploadToDrive({
-          folderName: `${folderName}/${day}/${sub}`,
+          folderName: `${folderName}/${senderFolder}/${sub}`,
           fileName,
           localFilePath: filePath,
           contentType,
@@ -1041,6 +1113,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         drivePath: up.drivePath,
         webUrl: up.webUrl,
         size: up.size,
+        senderFolder,
         ms: msSince(evT0),
       });
 
@@ -1053,7 +1126,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
           `${kindLabel} ใหม่ถูกส่งเข้ามา\n` +
           `ที่: ${sourceLabel(event)}\n` +
           `โฟลเดอร์: ${folderName}\n` +
-          `วันที่: ${day}\n` +
+          `ผู้ส่ง: ${senderFolder}\n` +
           `ชนิด: ${sub}\n` +
           `ไฟล์: ${fileName}\n` +
           `SharePoint: ${up.webUrl || "(ลิงก์อาจยังไม่พร้อม แต่ไฟล์อัปโหลดแล้ว)"}\n` +
@@ -1067,8 +1140,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
             {
               type: "text",
               text:
-                `✅ บันทึก${mtype === "image" ? "รูป" : mtype === "video" ? "วิดีโอ" : "ไฟล์"}แล้วครับ ` +
-                `(อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)`,
+                `✅ บันทึก${
+                  mtype === "image" ? "รูป" : mtype === "video" ? "วิดีโอ" : "ไฟล์"
+                }แล้วครับ ` + `(อัปโหลดขึ้น ${STORAGE_MODE} แล้ว)`,
             },
           ],
           { ...evMeta, messageId }
@@ -1080,16 +1154,16 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         try {
           fs.unlinkSync(filePath);
 
-          // remove empty sub/date/source dirs (best-effort)
+          // remove empty sub/sender/source dirs (best-effort)
           try {
             if (fs.existsSync(targetDir) && fs.readdirSync(targetDir).length === 0)
               fs.rmdirSync(targetDir);
           } catch {}
 
-          const dayDir = path.join(baseImagesDir, folderName, day);
+          const senderDir = path.join(baseImagesDir, folderName, senderFolder);
           try {
-            if (fs.existsSync(dayDir) && fs.readdirSync(dayDir).length === 0)
-              fs.rmdirSync(dayDir);
+            if (fs.existsSync(senderDir) && fs.readdirSync(senderDir).length === 0)
+              fs.rmdirSync(senderDir);
           } catch {}
 
           const parentDir = path.join(baseImagesDir, folderName);
@@ -1098,17 +1172,23 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
               fs.rmdirSync(parentDir);
           } catch {}
 
-          log("INFO", "LOCAL_CLEANUP_OK", { ...evMeta, messageId });
+          log("INFO", "LOCAL_CLEANUP_OK", { ...evMeta, messageId, senderFolder });
         } catch (e) {
           log("WARN", "LOCAL_CLEANUP_FAIL", {
             ...evMeta,
             messageId,
+            senderFolder,
             err: String(e?.message || e),
           });
         }
       }
 
-      log("INFO", "EVENT_DONE", { ...evMeta, messageId, ms: msSince(evT0) });
+      log("INFO", "EVENT_DONE", {
+        ...evMeta,
+        messageId,
+        senderFolder,
+        ms: msSince(evT0),
+      });
     } catch (err) {
       const msg = String(err?.message || err);
 
@@ -1180,11 +1260,13 @@ app.listen(PORT, () => {
   log("INFO", "SERVER_STARTED", {
     port: PORT,
     STORAGE_MODE,
+    ONEDRIVE_BASE_PATH,
     UPLOAD_CONCURRENCY,
     DELETE_LOCAL_AFTER_UPLOAD,
     ALLOW_VIDEO,
     ALLOW_FILE,
     MAX_VIDEO_MB,
     MAX_FILE_MB,
+    structure: "<root>/<source>/<sender>/<type>/file",
   });
 });
